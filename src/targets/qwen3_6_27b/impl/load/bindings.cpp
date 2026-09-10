@@ -103,17 +103,24 @@ WeightPlan bind_nvfp4_weight(artifact::Binder& binder, std::string_view name, st
 }
 
 Weight materialized_weight(const artifact::MaterializedArtifact& materialized,
-                           const WeightPlan& plan, std::int32_t rows, std::int32_t columns) {
+                           const WeightPlan& plan, std::int32_t rows, std::int32_t columns,
+                           bool prepack_for_qpn = true) {
     if (plan.format != NumericFormat::NVFP4) {
         Weight out = artifact::materialized_weight(materialized, plan.object, plan.format, rows,
                                                    columns);
 #ifdef NINFER_VOLTA_BUILD
-        if (out.qtype == QType::FP8_E4M3FN_ROW_BF16S) {
+        // The load-time QPN permutation is only legal for weights consumed by the QPN linear
+        // kernels. text/token_embedding is read row-major by the embedding gather, so it must
+        // keep its checkpoint layout.
+        if (prepack_for_qpn && out.qtype == QType::FP8_E4M3FN_ROW_BF16S) {
             ::ninfer::ops::detail::fp8_prepack_qpn_sm70(out);
         }
+#else
+        (void)prepack_for_qpn;
 #endif
         return out;
     }
+    (void)prepack_for_qpn;
 
     const std::array<std::uint64_t, 2> shape = {static_cast<std::uint64_t>(rows),
                                                 static_cast<std::uint64_t>(columns)};
@@ -518,7 +525,8 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     auto& final_norm      = runtime.final_norm;
     auto& output_head     = runtime.output_head;
 
-    token_embedding        = materialized_weight(backing, plan.token_embedding, 248320, 5120);
+    token_embedding        = materialized_weight(backing, plan.token_embedding, 248320, 5120,
+                                                /*prepack_for_qpn=*/false);
     std::size_t full_index = 0;
     std::size_t gdn_index  = 0;
     for (std::size_t layer = 0; layer < kTextLayers; ++layer) {
