@@ -1,13 +1,12 @@
 # NInfer
 
-> Selected checkpoints. Maximum single-GPU inference performance. Software NVFP4 on Volta.
+> Up to 219 decode tok/s from Qwen 3.8 27B on a single V100.  With software NVFP4 on Volta.
 
-NInfer is a from-scratch C++/CUDA inference engine for explicitly registered Qwen checkpoints on a
-single NVIDIA Tesla V100. It runs text, image, and video prompts through a local
-CLI or OpenAI-/Anthropic-compatible HTTP APIs. The runtime is deliberately specialized: one GPU,
-one resident model, and a startup-fixed capacity of one to eight active requests.
+NInfer is a from-scratch C++/CUDA inference engine optimized for selected Qwen checkpoints on NVIDIA Tesla V100.
 
-NInfer supports five artifact identities. The quick-start commands use Qwen3.8-27B NVFP4.
+It supports text, image, and video input through a local CLI or OpenAI-/Anthropic-compatible HTTP APIs. The runtime is intentionally narrow: one GPU, one resident model, 1–8 active requests.
+
+## Models
 
 | Model | Weights | Artifact | Download and model card |
 |---|---|---|---|
@@ -17,13 +16,12 @@ NInfer supports five artifact identities. The quick-start commands use Qwen3.8-2
 | Qwen3.8-27B | `nvfp4` | `qwen3_8_27b_nvfp4.ninfer` | [Qwen3.8-27B NVFP4](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer) |
 | Qwen3.6-35B-A3B | `groupwise-int` | `qwen3_6_35b_a3b.ninfer` | [Qwen3.6-35B-A3B](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer) |
 
-The artifact identity fixes the exact model and weight profile. Every artifact also embeds the
-tokenizer, chat template, and media frontend resources required by its registered target.
+Artifacts contain the exact model weights, tokenizer, chat template, and required media frontend resources.
 
 ## Performance
 
-[V100 qualification](docs/v100.md) records the Volta methodology, complete artifact sweep, and
-DFlash window sweep.
+Qwen3.8-27B NVFP4 reaches **218.98 decode tok/s** at K=1, with 99.2% MTP draft acceptance.
+That result is on a V100-PCIe-32GB, not SXM. The equivalent SXM2 card is roughly 7% faster; decode is predominantly HBM-bound, so PCIe bandwidth and host performance have little effect.
 
 ### Tesla V100: software NVFP4 and groupwise inference
 
@@ -71,12 +69,7 @@ Decode throughput depends strongly on draft acceptance -- see the MTP sweep abov
 The sm_70 width-6+ target-verify regression is fixed (see below), so `--spec mtp` now accepts the
 same [1,7] window upstream does, no Volta-specific cap. `--spec dflash2` peaks at K=7 on this same
 corpus-continuation shape (a 3-10 sweep falls off on both sides); MTP still leads DFlash2 here at
-every K tried. The
-Qwen3.6-35B-A3B `DFlash` row now reads 139.58 tok/s against a previously recorded 245.05 -- not a
-regression, though: the detailed 15-point DFlash K-sweep later in `docs/v100.md` was rewritten by
-the same commit that wrote 245.05 and puts K=4 at 120.97 tok/s, contradicting it outright. Today's
-139.58 sits right on that detailed table's trend (close to its K=3 peak of 125.85); 245.05 was
-simply wrong from the moment it was typed.
+every K tried.
 
 The Qwen3.8-27B artifacts also bundle DFlash2, the upstream masked-block speculative decoder
 (`--spec dflash2`); the sweep above uses MTP, which remains the recommended Volta backend for
