@@ -1,7 +1,9 @@
 #include "ninfer/ops/context_kv_materialize.h"
 
 #include "core/layout.h"
-#include "ops/context_kv_materialize/launch.h"
+#include "ninfer/ops/kv_cache_append.h"
+#include "ninfer/ops/linear.h"
+#include "ops/common/dflash2_rmsnorm_rope_volta.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -74,18 +76,6 @@ void require_interval(std::int32_t batch, std::int32_t min_width, std::int32_t m
     }
 }
 
-template <class Allocator>
-Tensor allocate_key_scratch(Allocator& allocator, std::int32_t columns) {
-    return allocator.alloc(
-        DType::FP32, {kKVSize, columns, static_cast<std::int32_t>(kContextKVMaterializeLayers)});
-}
-
-std::size_t key_scratch_capacity(std::int32_t columns) {
-    WorkspaceLayoutBuilder layout;
-    (void)allocate_key_scratch(layout, columns);
-    return layout.peak_bytes(1);
-}
-
 void validate_cache(const CyclicKVCacheLayerView& cache, std::int32_t padded,
                     std::int32_t lane_capacity) {
     if (cache.capacity != kCapacity ||
@@ -100,20 +90,22 @@ void validate_cache(const CyclicKVCacheLayerView& cache, std::int32_t padded,
 
 } // namespace
 
+template <class Allocator>
+void allocate_layer_scratch(Allocator& allocator, std::int32_t columns) {
+    (void)allocator.alloc(DType::BF16, {kKVSize, columns}); // key (norm+rope in place)
+    (void)allocator.alloc(DType::BF16, {kKVSize, columns}); // value
+}
+
 std::size_t context_kv_materialize_workspace_capacity_bytes(std::int32_t batch_size,
                                                             std::int32_t min_width,
                                                             std::int32_t max_width) {
     require_interval(batch_size, min_width, max_width);
-    std::size_t capacity = 0;
-    // Every W admits max_count=0..W. Thus max_width includes the envelopes of all smaller W,
-    // including scratch-requiring routes below the fully fused interval.
-    for (int count = 1; count <= max_width; ++count) {
-        const int columns = count * batch_size;
-        if (detail::context_kv_materialize_uses_scratch(
-                detail::context_kv_materialize_route(columns)))
-            capacity = std::max(capacity, key_scratch_capacity(columns));
-    }
-    return capacity;
+    // sm_70 port: composed from general W8 linear + head rmsnorm + rope + cyclic append, one
+    // layer at a time under a scoped sub-arena, so the peak is a single layer's three BF16
+    // [1024, max_width*B] scratch tensors.
+    WorkspaceLayoutBuilder layout;
+    allocate_layer_scratch(layout, max_width * batch_size);
+    return layout.peak_bytes(1);
 }
 
 void context_kv_materialize(
@@ -149,14 +141,33 @@ void context_kv_materialize(
     }
 
     if (envelope.max_count == 0) return;
-    const int columns = envelope.max_count * batch;
-    const auto route  = detail::context_kv_materialize_route(columns);
-    auto scope        = workspace.scope();
-    Tensor key_scratch;
-    if (detail::context_kv_materialize_uses_scratch(route))
-        key_scratch = allocate_key_scratch(workspace, columns);
-    detail::context_kv_materialize_launch(context, positions, counts, state_slots, layers, envelope,
-                                          route, key_scratch, stream);
+
+    // sm_70 port: no fused kernel yet. Compose the five layers from the general W8 projection,
+    // per-head RMSNorm, 1-D RoPE and the cyclic-prefix append -- exactly the unfused reference
+    // in the header's formula. One layer at a time keeps the workspace to a single layer.
+    const std::int32_t width_columns = width * batch;
+    const KVCacheAppendPrefixExecutionEnvelope append_envelope{envelope.min_count,
+                                                               envelope.max_count};
+    const Tensor context_flat  = context.view({kHidden, width_columns});
+    const Tensor positions_flat = positions.view({width_columns});
+
+    for (const ContextKVMaterializeLayerView& layer : layers) {
+        auto layer_scope = workspace.scope();
+        Tensor key   = workspace.alloc(DType::BF16, {kKVSize, width_columns});
+        Tensor value = workspace.alloc(DType::BF16, {kKVSize, width_columns});
+
+        linear(context_flat, layer.key_weight, key, stream);
+        linear(context_flat, layer.value_weight, value, stream);
+
+        Tensor key_heads = key.view({kHeadDim, kKVHeads, width_columns});
+        detail::dflash2_rmsnorm_rope_launch(key_heads, layer.key_norm_weight, positions_flat,
+                                            1.0e-6F, 1.0e7F, stream);
+
+        Tensor key_batch   = key.view({kHeadDim, kKVHeads, width, batch});
+        Tensor value_batch = value.view({kHeadDim, kKVHeads, width, batch});
+        kv_cache_append_prefix(key_batch, value_batch, positions, counts, state_slots,
+                               append_envelope, layer.cache, stream);
+    }
 }
 
 } // namespace ninfer::ops

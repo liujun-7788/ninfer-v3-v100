@@ -18,12 +18,14 @@ sliding_window_attention_volta_kernel(
     const __nv_bfloat16* __restrict__ query_v, const std::int32_t* __restrict__ positions,
     const std::int32_t* __restrict__ valid_columns, const std::int32_t* __restrict__ lanes,
     const __nv_bfloat16* __restrict__ context_k,
-    const __half* __restrict__ context_v, int padded_context, int tokens, float scale,
-    __nv_bfloat16* __restrict__ out) {
+    const __half* __restrict__ context_v, int padded_context, int tokens, int window,
+    float scale, __nv_bfloat16* __restrict__ out) {
     constexpr int D       = kContextQueryHeadDim;
     constexpr int QHeads  = kContextQueryQHeads;
     constexpr int KVHeads = kContextQueryKVHeads;
-    constexpr int Window  = 4096;
+    // Window is 2048 (DFlash2 local layers) or 4096 (DFlash1); both are powers of two so the
+    // ring slot stays `key & (Window - 1)`.
+    const int Window = window;
 
     __shared__ float warp_sums[kSlidingWindowVoltaThreads / kWarpSize];
     __shared__ float score_s;

@@ -1,6 +1,6 @@
 #include "ninfer/ops/candidate_selector.h"
 
-#include "ops/candidate_selector/bf16/candidate_selector_path_plan.h"
+#include "ops/candidate_selector/bf16/dflash2_selector_volta.h"
 
 #include <array>
 #include <cstddef>
@@ -80,14 +80,8 @@ std::size_t candidate_selector_path_workspace_capacity_bytes(int min_steps, int 
     if (min_steps < 1 || max_steps > 15 || max_steps < min_steps || min_batch < 1 ||
         max_batch > 8 || max_batch < min_batch)
         throw std::invalid_argument("selector workspace: invalid K/B interval");
-    WorkspaceLayoutBuilder layout;
-    for (int k = min_steps; k <= max_steps; ++k)
-        for (int b = min_batch; b <= max_batch; ++b) {
-            auto scope = layout.scope();
-            (void)detail::allocate_selector_workspace(
-                layout, detail::candidate_selector_path_route(k, b), k, b);
-        }
-    return layout.peak_bytes();
+    // sm_70 port: the greedy walk needs no transient workspace.
+    return 0;
 }
 
 void candidate_selector_path(const Tensor& candidate_ids, const Tensor& unary_scores,
@@ -120,9 +114,10 @@ void candidate_selector_path(const Tensor& candidate_ids, const Tensor& unary_sc
     require_nonoverlap(candidate_ids, unary_scores, projected_hidden, anchors, predecessor_codebook,
                        successor_codebook, base_positions, configs, drafts, proposal_q);
 
-    detail::candidate_selector_path_dispatch(
-        candidate_ids, unary_scores, projected_hidden, anchors, predecessor_codebook,
-        successor_codebook, base_positions, configs, drafts, proposal_q, workspace, stream);
+    (void)workspace;
+    detail::dflash2_candidate_selector_walk_launch(
+        candidate_ids, unary_scores, projected_hidden, anchors, base_positions, configs,
+        predecessor_codebook, successor_codebook, drafts, proposal_q, stream);
 }
 
 } // namespace ninfer::ops

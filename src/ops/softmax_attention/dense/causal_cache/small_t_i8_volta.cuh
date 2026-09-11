@@ -98,8 +98,8 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__
     const std::int32_t* block_tables, const std::int32_t* valid_columns,
     const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t tokens,
     std::int32_t full_width, std::int32_t column_begin, std::int32_t logical_capacity, float scale,
-    __nv_bfloat16* partial_acc, float* partial_m, float* partial_l) {
-    static_assert(TokenTile >= 1 && TokenTile <= 7);
+    float* partial_acc, float* partial_m, float* partial_l) {
+    static_assert(TokenTile >= 1 && TokenTile * Geometry::GroupSize <= 48);
     static_assert(WarpsPerCta == 4 || WarpsPerCta == 5);
 
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ == 700
@@ -196,7 +196,7 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__
             causal_small_t_tc_row_to_qt<Geometry>(row, tokens, kv_head, q_head, token);
             if (causal_valid_q_head<Geometry>(kv_head, q_head)) {
                 partial_acc[causal_partial_acc_index<Geometry>(q_head, d, token, split, tokens)] =
-                    __float2bfloat16(0.0f);
+                    0.0f;
             }
         }
     };
@@ -629,14 +629,12 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__
 #pragma unroll
                     for (int c = 0; c < DChunksLocal; ++c) {
                         const int d = dim_warp * DSlice + c * 8;
-                        __nv_bfloat16 out8[8];
-#pragma unroll
-                        for (int i = 0; i < 8; ++i) {
-                            out8[i] = __float2bfloat16(acc_f[c][i]);
-                        }
                         const std::int64_t dst = causal_partial_acc_index<Geometry>(
                             q_head, d, token, split, tokens);
-                        store_vec(&partial_acc[dst], *reinterpret_cast<const int4*>(out8));
+                        store_vec(&partial_acc[dst],
+                                  *reinterpret_cast<const int4*>(&acc_f[c][0]));
+                        store_vec(&partial_acc[dst + 4],
+                                  *reinterpret_cast<const int4*>(&acc_f[c][4]));
                     }
                 }
             }
@@ -669,7 +667,7 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__
                                                                   kv_head, q_head, token);
                             const std::int64_t dst = causal_partial_acc_index<Geometry>(
                                 q_head, d, token, split, tokens);
-                            partial_acc[dst] = __float2bfloat16(acc_f[c][i]);
+                            partial_acc[dst] = acc_f[c][i];
                         }
                     }
                 }

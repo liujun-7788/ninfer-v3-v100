@@ -16,9 +16,6 @@ enum class SparseMoeSmallTD4Schedule : std::uint8_t;
 
 struct SparseMoeDecodePlan {
     std::size_t workspace_bytes = 0;
-    // L2 cache hint resolved from the caller's SparseMoeHints. No numeric effect.
-    const void* next_weight_prefetch       = nullptr;
-    std::size_t next_weight_prefetch_bytes = 0;
 };
 
 struct SparseMoeDecodeWorkspace {
@@ -42,8 +39,7 @@ SparseMoeDecodeWorkspace allocate_sparse_moe_decode_workspace(Arena& arena) {
 
 [[nodiscard]] std::size_t sparse_moe_decode_workspace_bytes();
 [[nodiscard]] SparseMoeDecodePlan resolve_sparse_moe_decode_plan(QType routed_gate_up,
-                                                                 QType routed_down,
-                                                                 const SparseMoeHints& hints = {});
+                                                                 QType routed_down);
 
 void sparse_moe_decode_launch_d3_small_t(const Tensor& x, const SparseMoeWeights& weights,
                                          const int* token_ids, float* token_activations,
@@ -57,7 +53,6 @@ void sparse_moe_decode_launch_d4_small_t(const SparseMoeWeights& weights, Tensor
                                          cudaStream_t stream,
                                          const int* adaptive_route_jobs = nullptr);
 void sparse_moe_decode_launch(const Tensor& x, const SparseMoeWeights& weights, Tensor& destination,
-                              const SparseMoeDecodePlan& plan,
                               const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

@@ -27,32 +27,40 @@ DFlash window sweep.
 
 ### Tesla V100: software NVFP4 and groupwise inference
 
-The Qwen3.8-27B NVFP4 short-context MTP5 target round is **59.97 ms** with 5.0 licensed tokens,
-or **83.38 committed tok/s**.
+The Qwen3.8-27B NVFP4 short-context target round at the Volta `--spec mtp` cap of four draft
+tokens is **43.8 ms** with 4.1 licensed tokens, or **93.5 committed tok/s**.
 
-The single-request sweep uses the public Engine benchmark on a Tesla V100-SXM2-32GB with CUDA
+The single-request sweep uses the public Engine benchmark on a Tesla V100-PCIe-32GB with CUDA
 12.8 and INT8 group-64 KV. Prefill is an isolated `pp2048` run; decode is `pp2048+tg256` with CUDA
 Graphs and the optimized proposal head. Each result uses one discarded warmup and three measured
-repetitions.
+repetitions. On the DFlash window sweep in the V100 notes the preferred V100-SXM2-32GB ran about
+7% faster per round; this decode workload is HBM-bound, so the host and PCIe bus barely matter.
 
 | Model profile | MTP K | Prefill tok/s | Decode tok/s | Draft acceptance |
 |---|---:|---:|---:|---:|
-| Qwen3.6-27B `groupwise-int` | 4 | 1,086.2 | 56.71 | 65.2% |
-| Qwen3.6-27B `nvfp4` | 5 | 233.3 | 55.34 | 54.4% |
-| Qwen3.8-27B `groupwise-int` | 5 | 1,083.3 | 111.66 | 97.1% |
-| Qwen3.8-27B `nvfp4` | 5 | 1,107.1 | 130.20 | 97.1% |
-| Qwen3.6-35B-A3B `groupwise-int` | 5 | 754.5 | 261.69 | 91.8% |
+| Qwen3.6-27B `groupwise-int` | 4 | 1,070.3 | 52.51 | 62.4% |
+| Qwen3.6-27B `nvfp4` | 5 | 223.5 | 54.67 | 53.7% |
+| Qwen3.8-27B `groupwise-int` | 5 | 1,071.7 | 130.81 | 97.1% |
+| Qwen3.8-27B `nvfp4` | 5 | 1,093.7 | 199.38 | 97.1% |
+| Qwen3.6-35B-A3B `groupwise-int` | 4 | 689.7 | 245.05 | 90.3% |
 
 Decode throughput depends strongly on draft acceptance. The target-round result above is the
 ordinary Qwen3.8-27B NVFP4 headline; the sweep records the exact deterministic corpus continuation
-rather than treating its unusually high acceptance as a general-generation rate.
+rather than treating its unusually high acceptance as a general-generation rate. A draft window of
+three is the Volta sweet spot; the sm_70 build caps `--spec mtp` at four while the wide
+target-verify path is being restored.
 
-MTP automatically extends verification from five to fifteen draft tokens when the generated
-suffix exactly matches an earlier 16-token span and the learned five-token proposal agrees with
-the lookup continuation. On a 171-token verbatim-copy prompt, Qwen3.8-27B NVFP4 produced the exact
-143-token continuation at **140.06 tok/s**, against 77.88 tok/s with the lookup path disabled. It
-averaged 12.91 output tokens per round. This is a context-reproduction fast path; ordinary
-generation continues to use the normal MTP window and the general decode results above.
+The Qwen3.8-27B artifacts also bundle DFlash2, the upstream masked-block speculative decoder
+(`--spec dflash2`); the sweep above uses MTP, which remains the recommended Volta backend for
+general decoding, while DFlash2's heavier draft is strongest on long-context context-referential
+generation.
+
+MTP automatically extends verification up to fifteen draft tokens when the generated suffix
+exactly matches an earlier 16-token span and the learned proposal agrees with the lookup
+continuation. On a 172-token verbatim-copy prompt, Qwen3.8-27B NVFP4 produced the exact
+continuation at **201.0 tok/s**, averaging 12.91 output tokens per round. This is a
+context-reproduction fast path; ordinary generation continues to use the normal MTP window and
+the general decode results above.
 
 Context-lookup MTP was inspired by
 [syv-ai/qwen38-27b-rtx3090](https://github.com/syv-ai/qwen38-27b-rtx3090).
@@ -63,8 +71,8 @@ artifact on disk is unchanged and inference does not perform runtime weight repa
 QPN prepacking work was inspired by
 [dnv2003/v100-skinny](https://github.com/dnv2003/v100-skinny).
 
-The 35B-A3B production DFlash round at a 2,048-token context uses K=3: **134.33 tok/s**, 93.3%
-draft acceptance, and 3.8 mean output tokens per round over ten measured rounds after two warmups.
+The 35B-A3B production DFlash round at a 2,048-token context uses K=3: **125.9 tok/s** and 3.8
+mean output tokens per round over ten measured rounds after two warmups.
 
 ## Quick start
 
@@ -116,7 +124,7 @@ checkpoint retention:
   --device-state-slots 1 \
   --host-state-slots 8 \
   --host-kv-mib 8192 \
-  --spec mtp --draft-tokens 5 \
+  --spec mtp --draft-tokens 4 \
   --lm-head-draft \
   --preserve-thinking \
   --vision
@@ -192,7 +200,8 @@ correct/total counts and evaluation notes.
 ## Startup notes
 
 GPU residency is fixed at process startup. `--spec` selects speculative decoding residency, and
-`--vision` selects Vision residency. DFlash is available for text-only Qwen3.6-35B-A3B execution.
+`--vision` selects Vision residency. DFlash is available for text-only Qwen3.6-35B-A3B execution,
+and DFlash2 for Qwen3.8-27B.
 
 ## Docker
 
@@ -219,7 +228,7 @@ docker run --rm \
   --device-state-slots 1 \
   --host-state-slots 8 \
   --host-kv-mib 8192 \
-  --spec mtp --draft-tokens 5 \
+  --spec mtp --draft-tokens 4 \
   --lm-head-draft \
   --preserve-thinking \
   --vision
@@ -233,6 +242,8 @@ All registered model IDs support:
 - image, multi-image, video, and mixed multimodal messages;
 - chunked prefill, exact-batch CUDA Graph decode, and startup-bounded batched decode;
 - MTP speculative decoding with draft windows from one to seven;
+- DFlash2 masked-block speculative decoding for Qwen3.8-27B (from the upstream integration),
+  draft windows from one to fifteen;
 - BF16, INT8, and FP8 KV storage;
 - offline causal-perplexity scoring;
 - private and shared exact-prefix reuse with Device/Host State and KV retention;

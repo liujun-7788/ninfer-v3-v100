@@ -158,6 +158,24 @@ __device__ __forceinline__ int sampling_partial_offset(const SamplingWorkspace& 
     return ((col * workspace.partial_stride + partial) * kSamplerCandidateCap) + j;
 }
 
+// Volta lacks the sm_80 warp reduction intrinsic. These tile-merge sites reduce over a
+// contiguous low-lane group whose width (kSamplingTileWarps) is a power of two, so an XOR
+// butterfly stays inside the group and matches __reduce_max_sync exactly.
+template <int Width>
+__device__ __forceinline__ unsigned int sampling_group_reduce_max_u32(unsigned int mask,
+                                                                      unsigned int value) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    return __reduce_max_sync(mask, value);
+#else
+#pragma unroll
+    for (int offset = Width / 2; offset > 0; offset >>= 1) {
+        const unsigned int other = __shfl_xor_sync(mask, value, offset);
+        value                    = other > value ? other : value;
+    }
+    return value;
+#endif
+}
+
 __device__ inline void sampling_store_tile_topk(unsigned long long (&keys)[kSamplerItemsPerThread],
                                                 int cap, SamplingWorkspace workspace, int col,
                                                 int partial, SamplingTileTopKStorage& storage) {
@@ -181,9 +199,9 @@ __device__ inline void sampling_store_tile_topk(unsigned long long (&keys)[kSamp
             const unsigned long long key =
                 storage.candidates[lane * kSamplerCandidateCap + position];
             const unsigned int high     = static_cast<unsigned int>(key >> 32);
-            const unsigned int max_high = __reduce_max_sync(kMergeMask, high);
+            const unsigned int max_high = sampling_group_reduce_max_u32<kSamplingTileWarps>(kMergeMask, high);
             const unsigned int low      = high == max_high ? static_cast<unsigned int>(key) : 0u;
-            const unsigned int max_low  = __reduce_max_sync(kMergeMask, low);
+            const unsigned int max_low  = sampling_group_reduce_max_u32<kSamplingTileWarps>(kMergeMask, low);
             const unsigned int winners =
                 __ballot_sync(kMergeMask, high == max_high && low == max_low);
             const int source = __ffs(static_cast<int>(winners)) - 1;
@@ -220,7 +238,7 @@ __device__ inline void sampling_store_bf16_tile_topk(unsigned int (&keys)[kSampl
         int position                      = 0;
         for (int rank = 0; rank < cap; ++rank) {
             const unsigned int key     = storage.candidates[lane * kSamplerCandidateCap + position];
-            const unsigned int best    = __reduce_max_sync(kMergeMask, key);
+            const unsigned int best    = sampling_group_reduce_max_u32<kSamplingTileWarps>(kMergeMask, key);
             const unsigned int winners = __ballot_sync(kMergeMask, key == best);
             const int source           = __ffs(static_cast<int>(winners)) - 1;
             if (lane == 0) {

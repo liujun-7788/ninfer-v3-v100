@@ -47,14 +47,13 @@ void require_rowsplit(const Weight& weight, QType qtype, std::int32_t rows, cons
 }
 
 void require_w8_rowsplit(const Weight& weight, std::int32_t rows, std::int32_t hidden,
-                         const char* label) {
+                        const char* label) {
     if (weight.qtype != QType::W8G32_F16S || weight.layout != QuantLayout::RowSplit ||
         weight.scale_dtype != DType::FP16 || weight.group_size != 32 || weight.group != 32 ||
         weight.ndim != 2 || weight.n != rows || weight.k != hidden || weight.shape[0] != rows ||
         weight.shape[1] != hidden || weight.padded_shape[0] != rows ||
-        weight.padded_shape[1] != hidden || weight.qhigh != nullptr ||
-        weight.high_plane_bytes != 0 || !aligned_to(weight.qdata, 16) ||
-        !aligned_to(weight.scales, 16)) {
+        weight.padded_shape[1] != hidden || weight.qhigh != nullptr || weight.high_plane_bytes != 0 ||
+        !aligned_to(weight.qdata, 16) || !aligned_to(weight.scales, 16)) {
         throw std::invalid_argument(std::string("attn_input_proj: invalid ") + label);
     }
 }
@@ -167,7 +166,7 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
     require_matrix(gate, kQRows, cols, "gate");
     require_matrix(k, kKvRows, cols, "k");
     require_matrix(v, kKvRows, cols, "v");
-    require_w8_rowsplit(weight, kRows, kHidden, "query/key/gate/value weight");
+    require_w8_rowsplit(weight, kRows, 2048, "query/key/gate/value weight");
     detail::w8_attn_input_dispatch(x, weight, q, gate, k, v, stream);
 }
 

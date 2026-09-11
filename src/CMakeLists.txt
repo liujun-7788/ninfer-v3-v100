@@ -151,7 +151,7 @@ add_library(ninfer_ops STATIC
   ops/attn_input_proj/w8/w8_dflash2_attn_input.cu
   ops/attn_input_proj/w8/w8_attn_input_plan.cpp
   ops/gdn_input_proj/fp8/fp8_gdn_input_decode.cu
-  ops/gdn_input_proj/fp8/fp8_gdn_input_matrix.cu
+  ops/gdn_input_proj/fp8/fp8_gdn_input_small_t.cu
   ops/gdn_input_proj/fp8/fp8_gdn_input_a8.cu
   ops/gdn_input_proj/fp8/fp8_gdn_input_plan.cpp
   ops/gdn_input_proj/fp8/fp8_gdn_conv_fused.cu
@@ -277,6 +277,7 @@ add_library(ninfer_ops STATIC
   ops/wrapper/argmax.cpp
   ops/wrapper/cast.cpp
   ops/wrapper/causal_conv1d_silu.cpp
+  ops/dflash2_sm70_stub.cu
   ops/wrapper/candidate_selector.cpp
   ops/wrapper/dynamic_grouped_conv.cpp
   ops/wrapper/embedding.cpp
@@ -348,6 +349,37 @@ if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
     PROPERTIES
       INCLUDE_DIRECTORIES "${PROJECT_SOURCE_DIR}/third_party/llama_cpp_fattn"
       COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda;-diag-suppress=940>")
+  # --- DFlash2 port: these sm_80-only translation units (cp.async / bf16 mma /
+  #     __reduce_*_sync) have no Volta kernel yet. Exclude them from the sm_70 build;
+  #     the op wrappers throw std::logic_error under NINFER_VOLTA_BUILD until P2+.
+  set_source_files_properties(ops/launcher/rmsnorm_pack_tail.cu TARGET_DIRECTORY ninfer_ops PROPERTIES HEADER_FILE_ONLY ON)
+  set_source_files_properties(ops/rmsnorm_rope/launch.cu TARGET_DIRECTORY ninfer_ops PROPERTIES HEADER_FILE_ONLY ON)
+  set_source_files_properties(ops/context_kv_materialize/materialize.cu TARGET_DIRECTORY ninfer_ops PROPERTIES HEADER_FILE_ONLY ON)
+  set_source_files_properties(ops/candidate_selector/bf16/candidate_selector_path.cu TARGET_DIRECTORY ninfer_ops PROPERTIES HEADER_FILE_ONLY ON)
+  set_source_files_properties(ops/attn_input_proj/fp8/fp8_attn_input_a16_small_t.cu TARGET_DIRECTORY ninfer_ops PROPERTIES HEADER_FILE_ONLY ON)
+  set_source_files_properties(ops/attn_input_proj/fp8/fp8_attn_input_a16_gemm.cu TARGET_DIRECTORY ninfer_ops PROPERTIES HEADER_FILE_ONLY ON)
+  set_source_files_properties(ops/attn_input_proj/w8/w8_dflash2_attn_input.cu TARGET_DIRECTORY ninfer_ops PROPERTIES HEADER_FILE_ONLY ON)
+  set_source_files_properties(ops/gdn_gating_proj/bf16/bf16_gdn_norm_gating_proj_27.cu TARGET_DIRECTORY ninfer_ops PROPERTIES HEADER_FILE_ONLY ON)
+  set_source_files_properties(ops/dynamic_grouped_conv/bf16/bf16_dynamic_grouped_conv_prepare_partial.cu TARGET_DIRECTORY ninfer_ops PROPERTIES HEADER_FILE_ONLY ON)
+  set_source_files_properties(ops/dynamic_grouped_conv/bf16/bf16_dynamic_grouped_conv_prepare_reduce.cu TARGET_DIRECTORY ninfer_ops PROPERTIES HEADER_FILE_ONLY ON)
+  set_source_files_properties(ops/dynamic_grouped_conv/w8/w8_dynamic_grouped_conv_add_materialized.cu TARGET_DIRECTORY ninfer_ops PROPERTIES HEADER_FILE_ONLY ON)
+  set_source_files_properties(ops/linear/bf16/bf16_n256_k5120.cu TARGET_DIRECTORY ninfer_ops PROPERTIES HEADER_FILE_ONLY ON)
+  set_source_files_properties(ops/linear_swiglu/w8/w8_dflash2_linear_swiglu.cu TARGET_DIRECTORY ninfer_ops PROPERTIES HEADER_FILE_ONLY ON)
+  set_source_files_properties(ops/linear/w8/w8_feature.cu TARGET_DIRECTORY ninfer_ops PROPERTIES HEADER_FILE_ONLY ON)
+  set_source_files_properties(ops/linear_topk/w8.cu TARGET_DIRECTORY ninfer_ops PROPERTIES HEADER_FILE_ONLY ON)
+  set_source_files_properties(ops/linear_topk/w8_m64.cu TARGET_DIRECTORY ninfer_ops PROPERTIES HEADER_FILE_ONLY ON)
+  set_source_files_properties(ops/linear_topk/fp8.cu TARGET_DIRECTORY ninfer_ops PROPERTIES HEADER_FILE_ONLY ON)
+  set_source_files_properties(ops/linear_topk/fp8_m64.cu TARGET_DIRECTORY ninfer_ops PROPERTIES HEADER_FILE_ONLY ON)
+  set_source_files_properties(ops/linear_topk/q4.cu TARGET_DIRECTORY ninfer_ops PROPERTIES HEADER_FILE_ONLY ON)
+  set_source_files_properties(ops/linear_topk/q4_m64.cu TARGET_DIRECTORY ninfer_ops PROPERTIES HEADER_FILE_ONLY ON)
+  set_source_files_properties(ops/linear_topk/merge.cu TARGET_DIRECTORY ninfer_ops PROPERTIES HEADER_FILE_ONLY ON)
+  target_sources(ninfer_ops PRIVATE ops/dynamic_grouped_conv/volta/dflash2_dynamic_conv_volta.cu)
+  target_sources(ninfer_ops PRIVATE ops/attn_input_proj/w8/w8_dflash2_attn_input_volta.cu)
+  target_sources(ninfer_ops PRIVATE ops/launcher/rmsnorm_pack_tail_volta.cu)
+  target_sources(ninfer_ops PRIVATE ops/linear_topk/dflash2_linear_topk_volta.cu)
+  target_sources(ninfer_ops PRIVATE ops/linear/bf16/bf16_n256_k5120_volta.cu)
+  target_sources(ninfer_ops PRIVATE ops/candidate_selector/bf16/dflash2_selector_volta.cu)
+  target_sources(ninfer_ops PRIVATE ops/common/dflash2_rmsnorm_rope_volta.cu)
   target_link_libraries(ninfer_ops PRIVATE nvidia::cutlass::cutlass)
   target_compile_options(ninfer_ops PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)

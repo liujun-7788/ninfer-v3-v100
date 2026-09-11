@@ -226,6 +226,7 @@ set(ninfer_op_tests
   residual_add
   sigmoid_mul
   rmsnorm
+  rmsnorm_pack_tail
   gated_rmsnorm
   l2norm
   gated_delta_net
@@ -248,6 +249,14 @@ foreach(op IN LISTS ninfer_op_tests)
     SOURCES ops/test_${op}.cpp
     LIBRARIES ninfer_ops)
 endforeach()
+
+# DFlash2 draft-backbone op oracle tests (added for the V100 port).
+ninfer_add_op_test(ninfer_linear_topk_test SOURCES ops/test_linear_topk.cu LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_candidate_selector_test SOURCES ops/test_candidate_selector.cpp LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_rmsnorm_rope_test SOURCES ops/test_rmsnorm_rope.cpp LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_context_kv_materialize_test SOURCES ops/test_context_kv_materialize.cpp LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_dynamic_grouped_conv_prepare_test SOURCES ops/test_dynamic_grouped_conv_prepare.cpp LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_linear_dynamic_grouped_conv_add_test SOURCES ops/test_linear_dynamic_grouped_conv_add.cpp LIBRARIES ninfer_ops)
 
 # Stateful, fused, and exact-shape Ops remain central even when the current implementation domain
 # is one checkpoint/device.

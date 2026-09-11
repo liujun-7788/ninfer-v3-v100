@@ -73,6 +73,13 @@ W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
             if (t <= 895) { return launch_w8_mma_r32_c128; }
             return launch_w8_mma_r64_c128;
         }
+        if (n == 5120) {
+            // DFlash2 draft attention-output projection. On Volta every route below is
+            // redirected to the general SIMT kernel, so the exact table entry only needs to
+            // resolve without throwing.
+            if (t <= 48) { return launch_w8_small_t; }
+            return launch_w8_mma_r64_c128;
+        }
         break;
     case 2048:
         switch (n) {

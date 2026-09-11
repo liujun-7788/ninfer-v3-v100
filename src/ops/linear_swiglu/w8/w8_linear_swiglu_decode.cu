@@ -204,6 +204,16 @@ void launch_simt(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t str
 
 } // namespace
 
+void w8_linear_swiglu_decode_pair_launch(const Tensor& x, const Weight& w, Tensor& out,
+                                         cudaStream_t stream) {
+    launch_decode<8>(x, w, out, stream);
+}
+
+void w8_linear_swiglu_decode_pair_r4_launch(const Tensor& x, const Weight& w, Tensor& out,
+                                            cudaStream_t stream) {
+    launch_decode<4>(x, w, out, stream);
+}
+
 void w8_linear_swiglu_decode_pair_r16_launch(const Tensor& x, const Weight& w, Tensor& out,
                                              cudaStream_t stream) {
     launch_decode<16>(x, w, out, stream);

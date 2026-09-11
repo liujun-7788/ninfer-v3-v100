@@ -4,6 +4,7 @@
 #include "ops/common/warp.cuh"
 
 #include <cuda_runtime.h>
+#include <math_constants.h>
 
 namespace ninfer::ops::detail {
 
@@ -13,6 +14,7 @@ inline constexpr int kSparseMoeTopK    = 8;
 struct SparseMoeRankedValue {
     float value;
     int id;
+    int origin;
 };
 
 __device__ __forceinline__ bool sparse_moe_ranked_better(const SparseMoeRankedValue& a,
@@ -20,55 +22,33 @@ __device__ __forceinline__ bool sparse_moe_ranked_better(const SparseMoeRankedVa
     return a.value > b.value || (a.value == b.value && a.id < b.id);
 }
 
-// Merges the descending run of each lane with the run of its xor partner and keeps the better
-// half. The eight exchanges of a step do not depend on each other, so the warp reaches the
-// warp-wide top-8 in five merge steps instead of eight dependent reduction rounds. Ranking is a
-// total order over distinct expert ids, so the selected set and its order are the same as the
-// ones any other correct selection produces.
-__device__ __forceinline__ void
-sparse_moe_merge_ranked_runs(SparseMoeRankedValue (&run)[kSparseMoeTopK]) {
+__device__ __forceinline__ SparseMoeRankedValue sparse_moe_warp_best(SparseMoeRankedValue value) {
 #pragma unroll
-    for (int partner = 1; partner < 32; partner <<= 1) {
-        SparseMoeRankedValue merged[kSparseMoeTopK];
-#pragma unroll
-        for (int rank = 0; rank < kSparseMoeTopK; ++rank) {
-            const SparseMoeRankedValue mirror = run[kSparseMoeTopK - 1 - rank];
-            SparseMoeRankedValue other;
-            other.value  = __shfl_xor_sync(kFullWarpMask, mirror.value, partner);
-            other.id     = __shfl_xor_sync(kFullWarpMask, mirror.id, partner);
-            merged[rank] = sparse_moe_ranked_better(run[rank], other) ? run[rank] : other;
-        }
-        // The kept half is bitonic; three compare-exchange stages restore descending order.
-#pragma unroll
-        for (int stride = kSparseMoeTopK / 2; stride > 0; stride >>= 1) {
-#pragma unroll
-            for (int rank = 0; rank < kSparseMoeTopK; ++rank) {
-                if ((rank & stride) != 0) { continue; }
-                const int partner_rank = rank | stride;
-                if (!sparse_moe_ranked_better(merged[rank], merged[partner_rank])) {
-                    const SparseMoeRankedValue swap = merged[rank];
-                    merged[rank]                    = merged[partner_rank];
-                    merged[partner_rank]            = swap;
-                }
-            }
-        }
-#pragma unroll
-        for (int rank = 0; rank < kSparseMoeTopK; ++rank) { run[rank] = merged[rank]; }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        SparseMoeRankedValue other;
+        other.value  = __shfl_down_sync(kFullWarpMask, value.value, offset);
+        other.id     = __shfl_down_sync(kFullWarpMask, value.id, offset);
+        other.origin = __shfl_down_sync(kFullWarpMask, value.origin, offset);
+        if (sparse_moe_ranked_better(other, value)) { value = other; }
     }
+    value.value  = __shfl_sync(kFullWarpMask, value.value, 0);
+    value.id     = __shfl_sync(kFullWarpMask, value.id, 0);
+    value.origin = __shfl_sync(kFullWarpMask, value.origin, 0);
+    return value;
 }
 
 __device__ __forceinline__ void sparse_moe_select_top8_warp(const float* scores, int* ids,
                                                             float* alpha, float* shared_scale,
                                                             float* selected_logits) {
     const int lane = static_cast<int>(threadIdx.x) & 31;
-    SparseMoeRankedValue local[kSparseMoeTopK];
+    SparseMoeRankedValue local[8];
 #pragma unroll
-    for (int item = 0; item < kSparseMoeTopK; ++item) {
+    for (int item = 0; item < 8; ++item) {
         const int id = lane + item * 32;
-        local[item]  = {scores[id], id};
+        local[item]  = {scores[id], id, lane};
     }
 #pragma unroll
-    for (int i = 1; i < kSparseMoeTopK; ++i) {
+    for (int i = 1; i < 8; ++i) {
         const SparseMoeRankedValue value = local[i];
         int position                     = i;
         while (position > 0 && sparse_moe_ranked_better(value, local[position - 1])) {
@@ -77,16 +57,20 @@ __device__ __forceinline__ void sparse_moe_select_top8_warp(const float* scores,
         }
         local[position] = value;
     }
-    sparse_moe_merge_ranked_runs(local);
 
-    if (lane == 0) {
+    int cursor = 0;
 #pragma unroll
-        for (int rank = 0; rank < kSparseMoeTopK; ++rank) {
-            ids[rank]             = local[rank].id;
-            selected_logits[rank] = local[rank].value;
+    for (int rank = 0; rank < kSparseMoeTopK; ++rank) {
+        SparseMoeRankedValue candidate =
+            cursor < 8 ? local[cursor] : SparseMoeRankedValue{-CUDART_INF_F, 0x7fffffff, lane};
+        const SparseMoeRankedValue winner = sparse_moe_warp_best(candidate);
+        if (lane == 0) {
+            ids[rank]             = winner.id;
+            selected_logits[rank] = winner.value;
         }
+        if (lane == winner.origin) { ++cursor; }
+        __syncwarp();
     }
-    __syncwarp();
 
     float exponential = 0.0f;
     if (lane < kSparseMoeTopK) { exponential = expf(selected_logits[lane] - selected_logits[0]); }

@@ -8,7 +8,7 @@ namespace ninfer::ops {
 // The small-T policy requests roughly one split per 480 cached tokens. Keep that policy
 // unconstrained through the supported 262,144-token Volta context; the former 85-split ceiling
 // became binding near 41K and serialized progressively more KV work into each CTA.
-inline constexpr int kSmallTMaximumBaseSplits = 560;
+inline constexpr int kSmallTMaximumBaseSplits = 560; // fork c58a92ba long-context split scaling; the small_t reduce folds over 256 threads so splits may exceed blockDim.x
 #else
 inline constexpr int kSmallTMaximumBaseSplits = 85;
 #endif

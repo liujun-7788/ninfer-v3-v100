@@ -1,6 +1,6 @@
 #include "ninfer/ops/rmsnorm_rope.h"
 
-#include "ops/rmsnorm_rope/launch.h"
+#include "ops/common/dflash2_rmsnorm_rope_volta.h"
 
 #include <array>
 #include <cstddef>
@@ -73,8 +73,17 @@ void rmsnorm_rope(const Tensor& positions, const Tensor& q_norm_weight, const Te
     require_tensor(k_norm_weight, DType::BF16, {kHeadDim, 1, 1, 1}, "k norm weight");
     require_tensor(positions, DType::I32, {width, batch, 1, 1}, "positions");
     require_pair_nonoverlap(positions, q_norm_weight, k_norm_weight, q, k);
-    detail::rmsnorm_rope_pair_launch(positions, q_norm_weight, k_norm_weight, q, k, width * batch,
-                                     stream);
+
+    // sm_70 port: plain per-head RMSNorm (eps 1e-6, no offset) then full-128 split-half 1-D
+    // RoPE (theta 1e7), all in place -- the header formula, unfused.
+    const std::int32_t columns = width * batch;
+    Tensor q_view              = q.view({kHeadDim, kQueryHeads, columns});
+    Tensor k_view              = k.view({kHeadDim, kKeyHeads, columns});
+    Tensor position_view       = positions.view({columns});
+    detail::dflash2_rmsnorm_rope_launch(q_view, q_norm_weight, position_view, 1.0e-6F, 1.0e7F,
+                                        stream);
+    detail::dflash2_rmsnorm_rope_launch(k_view, k_norm_weight, position_view, 1.0e-6F, 1.0e7F,
+                                        stream);
 }
 
 void rmsnorm_rope(const Tensor& positions, const Tensor& norm_weight, Tensor& x,
@@ -87,7 +96,11 @@ void rmsnorm_rope(const Tensor& positions, const Tensor& norm_weight, Tensor& x,
     require_tensor(norm_weight, DType::BF16, {kHeadDim, 1, 1, 1}, "norm weight");
     require_tensor(positions, DType::I32, {tokens, 1, 1, 1}, "positions");
     require_single_nonoverlap(positions, norm_weight, x);
-    detail::rmsnorm_rope_single_launch(positions, norm_weight, x, tokens, stream);
+
+    Tensor x_view        = x.view({kHeadDim, kKeyHeads, tokens});
+    Tensor position_view = positions.view({tokens});
+    detail::dflash2_rmsnorm_rope_launch(x_view, norm_weight, position_view, 1.0e-6F, 1.0e7F,
+                                        stream);
 }
 
 } // namespace ninfer::ops

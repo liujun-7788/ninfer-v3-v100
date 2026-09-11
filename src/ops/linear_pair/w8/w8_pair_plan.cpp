@@ -22,13 +22,19 @@ struct W8PairRouteSpec {
 };
 
 #ifdef NINFER_VOLTA_BUILD
-// DualMmaR32C128 needs Ampere+ mma/ldmatrix, trap-stubbed on sm_70. launch_tiled (below) already
-// wraps every schedule -- TwoSimtR8C8 included -- in for_each_token_slice, tiling over any T in
-// 8-column chunks, so the {57,kAnyCols} split above is a routing choice, not a kernel limit.
-// See docs/v100.md.
-constexpr std::array<W8PairRouteSpec, 2> kK5120Routes{{
-    {1, 4, W8PairScheduleId::TwoSimtR8C4},
-    {5, kAnyCols, W8PairScheduleId::TwoSimtR8C8},
+// sm_70 has no Ampere mma/ldmatrix: every Dual*/Concat* MMA schedule is a hard launch failure
+// here (the kernels compile to __CUDA_ARCH__-guarded stubs). launch_tiled wraps TwoSimtR8C4 in
+// for_each_token_slice so it covers any T; DualDecodeR4 keeps the tuned T=1 decode step. This
+// restores the fork's Volta route tables dropped by the post-DFlash2-merge build-fix
+// (140d354d) -- MTP's W8 query_key_gate_value / gate_up pair projections route through here at
+// prompt widths above ~85 and crashed. See docs/v100.md.
+constexpr std::array<W8PairRouteSpec, 1> kK5120Routes{{
+    {1, kAnyCols, W8PairScheduleId::TwoSimtR8C4},
+}};
+
+constexpr std::array<W8PairRouteSpec, 2> kK2048Routes{{
+    {1, 1, W8PairScheduleId::DualDecodeR4},
+    {2, kAnyCols, W8PairScheduleId::TwoSimtR8C4},
 }};
 #else
 constexpr std::array<W8PairRouteSpec, 3> kK5120Routes{{
@@ -36,18 +42,7 @@ constexpr std::array<W8PairRouteSpec, 3> kK5120Routes{{
     {86, 960, W8PairScheduleId::DualMmaR32C64},
     {961, kAnyCols, W8PairScheduleId::DualMmaR32C128},
 }};
-#endif
 
-#ifdef NINFER_VOLTA_BUILD
-// DFlash's K/V row views use the same W8G32 RowSplit contract as the dense pair.
-// The two SIMT launchers are generic in K and tile arbitrary T through launch_tiled;
-// only the tuned Ampere+ route table made the k=2048 shape tensor-core-only past T=1.
-constexpr std::array<W8PairRouteSpec, 3> kK2048Routes{{
-    {1, 1, W8PairScheduleId::DualDecodeR4},
-    {2, 4, W8PairScheduleId::TwoSimtR8C4},
-    {5, kAnyCols, W8PairScheduleId::TwoSimtR8C8},
-}};
-#else
 constexpr std::array<W8PairRouteSpec, 37> kK2048Routes{{
     {1, 1, W8PairScheduleId::DualDecodeR4},
     {2, 32, W8PairScheduleId::DualSplitKMmaExactT},

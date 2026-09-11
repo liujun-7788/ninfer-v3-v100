@@ -2170,6 +2170,12 @@ int run_dflash2_cases() {
     for (auto storage :
          {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
           KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
+#ifdef NINFER_VOLTA_BUILD
+        if (storage == KvCacheStorage::Nvfp4Group16 ||
+            storage == KvCacheStorage::Fp8KeyNvfp4Value) {
+            continue; // NVFP4 / K8V4 KV-cache attention is unavailable on Volta
+        }
+#endif
         const auto run = [&](int width, int batch, int base, bool graph) {
             BatchAttentionCase c{width,
                                  {},
@@ -2214,6 +2220,12 @@ int run_batch_cases() {
     for (auto storage :
          {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
           KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
+#ifdef NINFER_VOLTA_BUILD
+        if (storage == KvCacheStorage::Nvfp4Group16 ||
+            storage == KvCacheStorage::Fp8KeyNvfp4Value) {
+            continue; // NVFP4 / K8V4 KV-cache attention is unavailable on Volta
+        }
+#endif
         failures += run_batch_case(kGeometries[0], storage,
                                    {16, {0}, {0}, {0}, MappingPattern::Fragmented, 1501u});
         failures += run_batch_case(kGeometries[0], storage,
@@ -2399,6 +2411,12 @@ int verify_workspace_capacity_contract() {
     for (const KvCacheStorage storage :
          {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
           KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
+#ifdef NINFER_VOLTA_BUILD
+        if (storage == KvCacheStorage::Nvfp4Group16 ||
+            storage == KvCacheStorage::Fp8KeyNvfp4Value) {
+            continue; // NVFP4 / K8V4 KV-cache attention is unavailable on Volta
+        }
+#endif
         constexpr ops::CausalAttentionExecutionEnvelope envelope{1, 1025};
         constexpr ops::AttentionHeadGeometry geometry{kHeadDim, 16, 2};
         const std::size_t interval = ops::causal_softmax_attention_workspace_capacity_bytes(

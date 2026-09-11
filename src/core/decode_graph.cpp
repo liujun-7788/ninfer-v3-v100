@@ -124,11 +124,25 @@ void DecodeGraphExecutable::update(const DecodeGraphDefinition& definition) {
 
     cudaGraphExecUpdateResultInfo result{};
     const cudaError_t err = cudaGraphExecUpdate(exec_, definition.graph_, &result);
-    if (err != cudaSuccess || result.result != cudaGraphExecUpdateSuccess) {
+    if (err == cudaSuccess && result.result == cudaGraphExecUpdateSuccess) { return; }
+
+    // cudaGraphExecUpdate only succeeds when the new definition is node-for-node compatible with
+    // the instantiated executable. Profiles in one topology class are meant to be, but a Volta
+    // verify-attention kernel whose grid / stream-node decomposition shifts with the attention
+    // frontier makes sibling profiles structurally different. Update is only an optimisation over
+    // re-instantiation, so fall back to a fresh executable rather than aborting the engine.
+    (void)cudaGetLastError();
+    reset();
+    cudaGraphExec_t fresh              = nullptr;
+    const cudaError_t reinstantiate_rc = cudaGraphInstantiate(&fresh, definition.graph_, 0);
+    if (reinstantiate_rc != cudaSuccess) {
+        destroy_graph_exec(fresh);
         throw std::runtime_error(
             "CUDA Graph executable update failed: " + std::string(cudaGetErrorName(err)) +
-            " (update result " + std::to_string(static_cast<int>(result.result)) + ")");
+            " (update result " + std::to_string(static_cast<int>(result.result)) +
+            "); re-instantiate also failed: " + std::string(cudaGetErrorName(reinstantiate_rc)));
     }
+    exec_ = fresh;
 }
 
 void DecodeGraphExecutable::upload(cudaStream_t stream) {

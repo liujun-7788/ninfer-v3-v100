@@ -107,8 +107,8 @@ void sliding_window_attention_launch(const Tensor& q, const Tensor& query_k, con
         static_cast<const std::int32_t*>(lanes.data),
         static_cast<const __nv_bfloat16*>(context.k.data),
         static_cast<const __half*>(context.v.data),
-        static_cast<int>(context.padded_capacity), q.ne[2], scale,
-        static_cast<__nv_bfloat16*>(out.data));
+        static_cast<int>(context.padded_capacity), q.ne[2],
+        static_cast<int>(context.capacity), scale, static_cast<__nv_bfloat16*>(out.data));
     CUDA_CHECK(cudaGetLastError());
     return;
 #else
