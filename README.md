@@ -36,19 +36,22 @@ Graphs and the optimized proposal head. Each result uses one discarded warmup an
 repetitions. On the DFlash window sweep in the V100 notes the preferred V100-SXM2-32GB ran about
 7% faster per round; this decode workload is HBM-bound, so the host and PCIe bus barely matter.
 
-| Model profile | MTP K | Prefill tok/s | Decode tok/s | Draft acceptance |
+| Model profile | K | Prefill tok/s | Decode tok/s | Draft acceptance |
 |---|---:|---:|---:|---:|
-| Qwen3.6-27B `groupwise-int` | 4 | 1,070.3 | 52.51 | 62.4% |
-| Qwen3.6-27B `nvfp4` | 5 | 223.5 | 54.67 | 53.7% |
-| Qwen3.8-27B `groupwise-int` | 5 | 1,071.7 | 130.81 | 97.1% |
-| Qwen3.8-27B `nvfp4` | 5 | 1,093.7 | 199.38 | 97.1% |
+| Qwen3.6-27B `groupwise-int` MTP | 4 | 1,070.3 | 52.51 | 62.4% |
+| Qwen3.6-27B `nvfp4` MTP | 5 | 223.5 | 54.67 | 53.7% |
+| Qwen3.8-27B `groupwise-int` MTP | 5 | 1,071.7 | 130.81 | 97.1% |
+| Qwen3.8-27B `nvfp4` MTP | 5 | 1,093.7 | 199.38 | 97.1% |
+| Qwen3.8-27B `groupwise-int` DFlash2 | 7 | 1,040.75 | 72.89 | 90.9% |
+| Qwen3.8-27B `nvfp4` DFlash2 | 7 | 1,060.74 | 117.38 | 90.9% |
 | Qwen3.6-35B-A3B `groupwise-int` | 4 | 689.7 | 245.05 | 90.3% |
 
 Decode throughput depends strongly on draft acceptance. The target-round result above is the
 ordinary Qwen3.8-27B NVFP4 headline; the sweep records the exact deterministic corpus continuation
 rather than treating its unusually high acceptance as a general-generation rate. A draft window of
-three is the Volta sweet spot; the sm_70 build caps `--spec mtp` at four while the wide
-target-verify path is being restored.
+three is the Volta sweet spot for MTP; the sm_70 build caps `--spec mtp` at four while the wide
+target-verify path is being restored. `--spec dflash2` peaks at K=7 on this same corpus-continuation
+shape (a 3-10 sweep falls off on both sides); MTP still leads DFlash2 here at every K tried.
 
 The Qwen3.8-27B artifacts also bundle DFlash2, the upstream masked-block speculative decoder
 (`--spec dflash2`); the sweep above uses MTP, which remains the recommended Volta backend for
