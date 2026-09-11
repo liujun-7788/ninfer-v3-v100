@@ -27,8 +27,9 @@ DFlash window sweep.
 
 ### Tesla V100: software NVFP4 and groupwise inference
 
-The Qwen3.8-27B NVFP4 short-context target round at the Volta `--spec mtp` cap of four draft
-tokens is **43.8 ms** with 4.1 licensed tokens, or **93.5 committed tok/s**.
+The Qwen3.8-27B NVFP4 short-context target round, retested after the width-6+ verify fix below,
+peaks at K=1 draft tokens: **219.0 decode tok/s** at 99.2% draft acceptance -- narrow windows win
+outright on this corpus; see the full K sweep below.
 
 The single-request sweep uses the public Engine benchmark on a Tesla V100-PCIe-32GB with CUDA
 12.8 and INT8 group-64 KV. Prefill is an isolated `pp2048` run; decode is `pp2048+tg256` with CUDA
@@ -38,20 +39,44 @@ repetitions. On the DFlash window sweep in the V100 notes the preferred V100-SXM
 
 | Model profile | K | Prefill tok/s | Decode tok/s | Draft acceptance |
 |---|---:|---:|---:|---:|
-| Qwen3.6-27B `groupwise-int` MTP | 4 | 1,070.3 | 52.51 | 62.4% |
-| Qwen3.6-27B `nvfp4` MTP | 5 | 223.5 | 54.67 | 53.7% |
-| Qwen3.8-27B `groupwise-int` MTP | 5 | 1,071.7 | 130.81 | 97.1% |
-| Qwen3.8-27B `nvfp4` MTP | 5 | 1,093.7 | 199.38 | 97.1% |
-| Qwen3.8-27B `groupwise-int` DFlash2 | 7 | 1,040.75 | 72.89 | 90.9% |
-| Qwen3.8-27B `nvfp4` DFlash2 | 7 | 1,060.74 | 117.38 | 90.9% |
-| Qwen3.6-35B-A3B `groupwise-int` | 4 | 689.7 | 245.05 | 90.3% |
+| Qwen3.6-27B `groupwise-int` MTP | 4 | 1,085.0 | 54.54 | 66.5% |
+| Qwen3.6-27B `nvfp4` MTP | 5 | 223.8 | 55.22 | 54.4% |
+| Qwen3.8-27B `groupwise-int` MTP | 5 | 1,083.9 | 130.96 | 97.1% |
+| Qwen3.8-27B `nvfp4` MTP | 5 | 1,100.3 | 199.58 | 97.1% |
+| Qwen3.8-27B `groupwise-int` DFlash2 | 7 | 1,044.2 | 77.84 | 100% |
+| Qwen3.8-27B `nvfp4` DFlash2 | 7 | 1,059.0 | 126.32 | 100% |
+| Qwen3.6-35B-A3B `groupwise-int` DFlash | 4 | 686.2 | 139.58 | 90.9% |
 
-Decode throughput depends strongly on draft acceptance. The target-round result above is the
-ordinary Qwen3.8-27B NVFP4 headline; the sweep records the exact deterministic corpus continuation
-rather than treating its unusually high acceptance as a general-generation rate. A draft window of
-three is the Volta sweet spot for MTP; the sm_70 build caps `--spec mtp` at four while the wide
-target-verify path is being restored. `--spec dflash2` peaks at K=7 on this same corpus-continuation
-shape (a 3-10 sweep falls off on both sides); MTP still leads DFlash2 here at every K tried.
+
+Full Qwen3.8-27B `nvfp4` MTP draft-window sweep on this same corpus-continuation shape, now that
+the width-6+ fix removes the sm_70 cap at four:
+
+| K | Prefill tok/s | Decode tok/s | Draft acceptance |
+|---:|---:|---:|---:|
+| 1 | 1,102.5 | **218.98** | 99.2% |
+| 2 | 1,097.4 | 213.99 | 98.3% |
+| 3 | 1,094.9 | 209.24 | 97.5% |
+| 4 | 1,096.6 | 204.02 | 97.9% |
+| 5 | 1,100.3 | 199.58 | 97.1% |
+| 6 | 1,089.6 | 178.47 | 92.5% |
+| 7 | 1,087.2 | 180.74 | 93.3% |
+
+This corpus is a deterministic continuation with unusually high, near-ceiling acceptance at every
+K, so narrow windows win outright: round-verify cost dominates once there's little more accepted
+length to buy. Treat these as a synthetic-corpus ceiling, not a general-generation rate -- on real,
+less predictable text the practical production sweet spot is K=3 (see the long-context sweep
+elsewhere in this repo's history).
+
+Decode throughput depends strongly on draft acceptance -- see the MTP sweep above for how much.
+The sm_70 width-6+ target-verify regression is fixed (see below), so `--spec mtp` now accepts the
+same [1,7] window upstream does, no Volta-specific cap. `--spec dflash2` peaks at K=7 on this same
+corpus-continuation shape (a 3-10 sweep falls off on both sides); MTP still leads DFlash2 here at
+every K tried. The
+Qwen3.6-35B-A3B `DFlash` row now reads 139.58 tok/s against a previously recorded 245.05 -- not a
+regression, though: the detailed 15-point DFlash K-sweep later in `docs/v100.md` was rewritten by
+the same commit that wrote 245.05 and puts K=4 at 120.97 tok/s, contradicting it outright. Today's
+139.58 sits right on that detailed table's trend (close to its K=3 peak of 125.85); 245.05 was
+simply wrong from the moment it was typed.
 
 The Qwen3.8-27B artifacts also bundle DFlash2, the upstream masked-block speculative decoder
 (`--spec dflash2`); the sweep above uses MTP, which remains the recommended Volta backend for
