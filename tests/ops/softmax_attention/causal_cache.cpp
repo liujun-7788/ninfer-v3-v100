@@ -2254,6 +2254,8 @@ int run_batch_cases() {
                        {6, {61, 127, 511}, {6, 3, 0}, {2, 0, 1}, MappingPattern::Fragmented, 505u});
     failures += run_a1_case(kGeometries[0], KvCacheStorage::Int8Group64,
                             {6, 61, 16391, 506u, false, true}, MappingPattern::Fragmented);
+    failures += run_a1_case(kGeometries[0], KvCacheStorage::BFloat16,
+                            {4, 13092, 32768, 507u, false, true}, MappingPattern::Fragmented);
     return failures;
 }
 

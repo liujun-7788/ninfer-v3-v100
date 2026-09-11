@@ -8,6 +8,7 @@
 #include "ops/softmax_attention/dense/causal_cache/small_t_bf16.cuh"
 #include "ops/softmax_attention/dense/causal_cache/small_t_i8.cuh"
 #ifdef NINFER_VOLTA_BUILD
+#include "ops/softmax_attention/dense/causal_cache/small_t_bf16_volta.cuh"
 #include "ops/softmax_attention/dense/causal_cache/small_t_i8_volta.cuh"
 #endif
 #include "core/device.h" // CUDA_CHECK
@@ -101,10 +102,32 @@ void launch_tc_partial_bf16(const Tensor& q, CacheInput input, const Tensor& pos
                             PagedKVBatchLayerView cache, const CausalSmallTInvocation& invocation,
                             std::int32_t logical_capacity, std::int32_t splits, Tensor& partial_acc,
                             Tensor& partial_m, Tensor& partial_l, cudaStream_t stream) {
-    constexpr int kBlock = 32 * WarpsPerCta;
     const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
     Tensor& cache_k = cache.k_pages;
     Tensor& cache_v = cache.v_pages;
+#ifdef NINFER_VOLTA_BUILD
+    // e04d8de5 accidentally dropped this dedicated Volta tensor-core route and sent BF16 decode
+    // through the generic SIMT fallback, regressing long-context decode by roughly 2x.
+    causal_attention_small_t_tc_volta_partial_bf16_kernel<Geometry, TokenTile, 4, MultiBatch,
+                                                          Masked, CacheInput>
+        <<<grid, 128, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(q.data), input,
+            static_cast<const std::int32_t*>(pos.data), static_cast<__nv_bfloat16*>(cache_k.data),
+            static_cast<__half*>(cache_v.data),
+            static_cast<const std::int32_t*>(cache.block_tables.data),
+            invocation.valid_columns == nullptr
+                ? nullptr
+                : static_cast<const std::int32_t*>(invocation.valid_columns->data),
+            invocation.table_rows == nullptr
+                ? nullptr
+                : static_cast<const std::int32_t*>(invocation.table_rows->data),
+            cache.block_tables.ne[0], invocation.width, invocation.full_width,
+            invocation.column_begin, logical_capacity, scale, static_cast<float*>(partial_acc.data),
+            static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
+    CUDA_CHECK(cudaGetLastError());
+    return;
+#endif
+    constexpr int kBlock = 32 * WarpsPerCta;
     // bf16 kernel uses only static smem (no dynamic staging).
     causal_attention_small_t_tc_partial_bf16_kernel<Geometry, TokenTile, WarpsPerCta, MultiBatch,
                                                     Masked, CacheInput>
