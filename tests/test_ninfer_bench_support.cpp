@@ -81,8 +81,11 @@ int test_cli_contract() {
         "128",
         "--kv-dtype",
         "int8",
-        "--mtp-draft-tokens",
-        "5",
+        "--spec",
+        "mtp",
+        "--draft-tokens",
+        // Kept within the sm_70 MTP cap ([1,4]; [1,7] off Volta) so this parses on every build.
+        "4",
         "--lm-head-draft",
         "--device",
         "1",
@@ -103,9 +106,10 @@ int test_cli_contract() {
     failures += expect(parsed.max_context == std::optional<std::uint32_t>(4096), "max context");
     failures += expect(parsed.prefill_chunk == 128, "prefill chunk");
     failures += expect(parsed.kv_cache == ninfer::KvCacheStorage::Int8Group64, "INT8 KV");
-    failures += expect(parsed.mtp_draft_tokens == 5, "MTP window");
-    failures +=
-        expect(parsed.proposal_head == ninfer::ProposalHead::Optimized, "optimized proposal head");
+    failures += expect(parsed.speculative.backend == ninfer::SpeculativeBackend::Mtp, "spec backend");
+    failures += expect(parsed.speculative.draft_tokens == 4, "MTP window");
+    failures += expect(parsed.speculative.proposal_head == ninfer::ProposalHead::Optimized,
+                       "optimized proposal head");
     failures += expect(parsed.device == 1 && !parsed.use_cuda_graph, "device and graph settings");
     failures += expect(parsed.profile_measured, "profile-measured flag");
     failures +=
@@ -126,13 +130,25 @@ int test_cli_contract() {
         [] {
             (void)parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--lm-head-draft"});
         },
-        "optimized head without MTP");
+        "optimized head without draft tokens");
+    failures += expect_throws<std::invalid_argument>(
+        [] {
+            (void)parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--spec", "mtp",
+                                  "--draft-tokens", "8"});
+        },
+        "unsupported MTP window");
     failures += expect_throws<std::invalid_argument>(
         [] {
             (void)parse_for_test(
-                {"ninfer_bench", "--weights", "model.ninfer", "--mtp-draft-tokens", "8"});
+                {"ninfer_bench", "--weights", "model.ninfer", "--spec", "bogus"});
         },
-        "unsupported MTP window");
+        "unknown speculative backend");
+    const qb::BenchOptions dflash2 = parse_for_test({"ninfer_bench", "--weights", "model.ninfer",
+                                                     "--spec", "dflash2", "--draft-tokens", "10",
+                                                     "--lm-head-draft"});
+    failures += expect(dflash2.speculative.backend == ninfer::SpeculativeBackend::DFlash2,
+                       "dflash2 backend selected");
+    failures += expect(dflash2.speculative.draft_tokens == 10, "dflash2 draft window");
     failures += expect_throws<std::invalid_argument>(
         [] {
             (void)parse_for_test(
@@ -270,8 +286,9 @@ qb::BenchEnvironment sample_environment() {
     env.max_context                       = 4096;
     env.prefill_chunk                     = 1024;
     env.kv_cache                          = ninfer::KvCacheStorage::Int8Group64;
-    env.mtp_draft_tokens                  = 5;
-    env.proposal_head                     = ninfer::ProposalHead::Optimized;
+    env.speculative.backend               = ninfer::SpeculativeBackend::Mtp;
+    env.speculative.draft_tokens          = 5;
+    env.speculative.proposal_head         = ninfer::ProposalHead::Optimized;
     env.use_cuda_graph                    = true;
     env.decode_graph_primed               = true;
     env.decode_graph_prime_output_tokens  = 13;
@@ -289,12 +306,12 @@ int test_report_contract() {
     Json report;
     try {
         report = Json::parse(qb::format_json(
-            env, "ninfer_bench --weights model.ninfer --mtp-draft-tokens 5", results));
+            env, "ninfer_bench --weights model.ninfer --spec mtp --draft-tokens 5", results));
     } catch (const nlohmann::json::exception& error) {
         return fail(std::string("invalid benchmark JSON: ") + error.what());
     }
 
-    failures += expect(report.at("schema_version") == 13, "report schema v13");
+    failures += expect(report.at("schema_version") == 14, "report schema v14");
     failures += expect(report.at("artifact_type") == "ninfer_bench_report", "report identity");
     failures += expect(report.at("artifact").at("path") == "model.ninfer", "artifact path");
     failures += expect(report.at("load").at("target") == "qwen3_6_27b", "load target");
@@ -312,7 +329,10 @@ int test_report_contract() {
     failures += expect(report.at("memory").at("cuda_graph_allowance_bytes") == 150000000ULL,
                        "CUDA Graph allowance");
     failures += expect(report.at("memory").at("kv_payload_bytes") == 123456ULL, "KV payload");
+    failures += expect(report.at("config").at("speculative_backend") == "mtp", "spec backend");
+    failures += expect(report.at("config").at("draft_tokens") == 5, "spec draft tokens");
     failures += expect(report.at("config").at("proposal_head") == "optimized", "proposal head");
+    failures += expect(report.at("config").at("decode_path") == "mtp_cuda_graph", "decode path");
     failures += expect(report.at("config").at("decode_graph_prime").at("output_tokens") == 13,
                        "graph prime output count");
 
@@ -357,6 +377,8 @@ int test_human_and_csv_reports() {
     failures += expect(table.find("qwen3_6_27b") != std::string::npos, "table target");
     failures += expect(table.find("groupwise-int") != std::string::npos, "table weights id");
     failures += expect(table.find("model.ninfer") != std::string::npos, "table artifact");
+    failures += expect(table.find("spec=mtp") != std::string::npos, "table spec backend");
+    failures += expect(table.find("draft_k=5") != std::string::npos, "table draft window");
     failures +=
         expect(table.find("proposal_head=optimized") != std::string::npos, "table proposal head");
     failures +=
@@ -367,7 +389,8 @@ int test_human_and_csv_reports() {
     failures += expect(csv.starts_with("label,kind,n_prompt,n_gen,target,weights_id"),
                        "CSV identity columns");
     for (const std::string_view field :
-         {"proposal_head", "kv_payload_bytes", "load_host_to_device_bytes",
+         {"speculative_backend", "draft_tokens", "proposal_head", "kv_payload_bytes",
+          "load_host_to_device_bytes",
           "workspace_general_capacity_bytes", "vision_handoff_capacity_bytes",
           "cuda_graph_allowance_bytes", "workspace_peak_bytes", "workspace_allocator_peak_bytes",
           "spec_acceptance_rate", "decode_output_tok_s_mean", "decode_engine_tok_s_mean",
