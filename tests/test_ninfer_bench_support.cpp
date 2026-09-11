@@ -84,8 +84,8 @@ int test_cli_contract() {
         "--spec",
         "mtp",
         "--draft-tokens",
-        // Kept within the sm_70 MTP cap ([1,4]; [1,7] off Volta) so this parses on every build.
-        "4",
+        // [1,7] on every build now that the sm_70 width-6+ verify regression is fixed.
+        "5",
         "--lm-head-draft",
         "--device",
         "1",
@@ -107,7 +107,7 @@ int test_cli_contract() {
     failures += expect(parsed.prefill_chunk == 128, "prefill chunk");
     failures += expect(parsed.kv_cache == ninfer::KvCacheStorage::Int8Group64, "INT8 KV");
     failures += expect(parsed.speculative.backend == ninfer::SpeculativeBackend::Mtp, "spec backend");
-    failures += expect(parsed.speculative.draft_tokens == 4, "MTP window");
+    failures += expect(parsed.speculative.draft_tokens == 5, "MTP window");
     failures += expect(parsed.speculative.proposal_head == ninfer::ProposalHead::Optimized,
                        "optimized proposal head");
     failures += expect(parsed.device == 1 && !parsed.use_cuda_graph, "device and graph settings");

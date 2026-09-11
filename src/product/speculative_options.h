@@ -38,23 +38,15 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
         }
         return;
     case SpeculativeBackend::Mtp:
-#ifdef NINFER_VOLTA_BUILD
-        // sm_70: the width-6+ target-verify attention (draft window >= 5, non-lookup) regressed
-        // in the upstream DFlash2 merge and drifts off the greedy argmax. Draft windows 1-4
-        // (verify width <= 5) and the context-lookup continuation path (verify width 15) are
-        // lossless. Cap here until the causal_cache small_t_i8 verify tail is restored.
-        if (options.draft_tokens == 0 || options.draft_tokens > 4) {
-            throw std::invalid_argument(
-                "--spec mtp requires --draft-tokens in [1,4] on the sm_70 build "
-                "(width-6+ verify regressed in the DFlash2 merge); use --spec dflash2 for wider windows");
-        }
-        return;
-#else
+        // The sm_70 width-6+ target-verify regression (draft window >= 5 drifting off the
+        // greedy argmax) tracked back to the dedicated Volta small_t_i8/bf16 verify kernels
+        // dropped during the DFlash2 merge; both are restored (small_t_i8_volta.cuh,
+        // small_t_bf16_volta.cuh) and every draft window through 7 is bit-exact against
+        // --spec none again, so sm_70 no longer needs a narrower cap than upstream.
         if (options.draft_tokens == 0 || options.draft_tokens > 7) {
             throw std::invalid_argument("--spec mtp requires --draft-tokens in [1,7]");
         }
         return;
-#endif
     case SpeculativeBackend::DFlash:
         if (options.draft_tokens == 0 || options.draft_tokens > 15) {
             throw std::invalid_argument("--spec dflash requires --draft-tokens in [1,15]");
