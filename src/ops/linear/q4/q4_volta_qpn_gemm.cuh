@@ -47,7 +47,10 @@
 // memory.
 
 #include "ops/common/volta_mma.cuh"
+#include "ops/common/score_id_order.cuh"
 #include "ops/linear/q4/q4_rowsplit_storage.cuh"
+
+#include <cub/warp/warp_merge_sort.cuh>
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -71,16 +74,19 @@ struct Q4VoltaQpnSchedule {
 //
 // `kBlk` is how many Q4 groups a lane reads before consuming any of them; kBlk * kCodeB bytes.
 // It trades registers for read efficiency and the right value depends on n -- see the launcher.
-template <int kTiles, int kBlk>
+template <int kTiles, int kBlk, bool kProduceTopK = false>
 __global__ __launch_bounds__(Q4VoltaQpnSchedule::kThreads, 8) void q4_volta_qpn_gemm_kernel(
     const std::uint8_t* __restrict__ codes, const std::uint8_t* __restrict__ scales,
     const __nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ out, int n, int k, int t,
-    int padded_groups, int out_ld) {
+    int padded_groups, int out_ld, const std::int32_t* __restrict__ row_to_global_ids = nullptr,
+    std::uint64_t* __restrict__ partial_keys = nullptr, int producer_groups = 0) {
     using S = Q4VoltaQpnSchedule;
     constexpr int kGroupK = Q4RowSplitStorage::kGroupK;
     constexpr int kCodeB  = Q4RowSplitStorage::kCodeBytesPerGroup;
 
     __shared__ float cs[S::kWarps][kTiles * S::kRowsPerTile * S::kColsPerCta];
+    using TopKSort = cub::WarpMergeSort<std::uint64_t, 1, 32>;
+    __shared__ typename TopKSort::TempStorage topk_sort[S::kWarps];
 
     const int lane = static_cast<int>(threadIdx.x) & 31;
     const int warp = static_cast<int>(threadIdx.x) >> 5;
@@ -209,16 +215,43 @@ __global__ __launch_bounds__(Q4VoltaQpnSchedule::kThreads, 8) void q4_volta_qpn_
     }
     __syncthreads(); // the only barrier: cross-warp K reduce
 
-    constexpr int kOut = kTiles * S::kRowsPerTile * S::kColsPerCta;
-    for (int e = static_cast<int>(threadIdx.x); e < kOut; e += S::kThreads) {
-        const int row  = e / S::kColsPerCta;
-        const int cl   = e % S::kColsPerCta;
-        const int ocol = static_cast<int>(blockIdx.x) * S::kColsPerCta + cl;
-        if (row < t && ocol < n) {
+    if constexpr (!kProduceTopK) {
+        constexpr int kOut = kTiles * S::kRowsPerTile * S::kColsPerCta;
+        for (int e = static_cast<int>(threadIdx.x); e < kOut; e += S::kThreads) {
+            const int row  = e / S::kColsPerCta;
+            const int cl   = e % S::kColsPerCta;
+            const int ocol = static_cast<int>(blockIdx.x) * S::kColsPerCta + cl;
+            if (row < t && ocol < n) {
+                float v = 0.0f;
+#pragma unroll
+                for (int w = 0; w < S::kWarps; ++w) { v += cs[w][e]; }
+                out[static_cast<std::int64_t>(row) * out_ld + ocol] = __float2bfloat16(v);
+            }
+        }
+    } else {
+        static_assert(kTiles == 1, "the DFlash2 fused top-K route is limited to T <= 8");
+        // The QPN CTA already owns exactly 32 vocabulary rows. Reduce its four K partitions,
+        // reproduce the materialized BF16-logit rounding boundary, sort the 32 order keys in a
+        // warp, and emit the best 16 directly. The ordinary merge kernels combine CTA winners.
+        const int producer = static_cast<int>(blockIdx.x);
+        for (int row = warp; row < t; row += S::kWarps) {
+            const int ocol = producer * S::kColsPerCta + lane;
             float v = 0.0f;
 #pragma unroll
-            for (int w = 0; w < S::kWarps; ++w) { v += cs[w][e]; }
-            out[static_cast<std::int64_t>(row) * out_ld + ocol] = __float2bfloat16(v);
+            for (int w = 0; w < S::kWarps; ++w) {
+                v += cs[w][row * S::kColsPerCta + lane];
+            }
+            std::uint64_t key[1] = {0};
+            if (ocol < n) {
+                const float rounded = __bfloat162float(__float2bfloat16(v));
+                key[0] = score_id_order_key(rounded, row_to_global_ids[ocol]);
+            }
+            TopKSort(topk_sort[warp]).Sort(key, ScoreIdOrderGreater{});
+            if (lane < 16) {
+                const std::int64_t offset =
+                    (static_cast<std::int64_t>(row) * producer_groups + producer) * 16 + lane;
+                partial_keys[offset] = key[0];
+            }
         }
     }
 }

@@ -1,7 +1,10 @@
 #include "ninfer/ops/linear_topk.h"
 
+#include "core/layout.h"
+#include "ops/linear/q4/q4_launch.h"
 #include "ops/linear/fp8/fp8_format.h"
 #include "ops/linear_topk/dflash2_linear_topk_volta.h"
+#include "ops/linear_topk/linear_topk_launch.h"
 #include "ninfer/ops/linear.h"
 #include "ops/linear_topk/linear_topk_workspace.h"
 
@@ -117,6 +120,23 @@ void execute(const Tensor& hidden, const Weight& head, const Tensor* id_map, Ten
     const std::int32_t valid_rows = profile == HeadProfile::Q4Optimized
                                         ? detail::kLinearTopKOptimizedRows
                                         : detail::kLinearTopKFullValidRows;
+#ifdef NINFER_VOLTA_BUILD
+    // K=4..7 DFlash2 supplies 5..8 proposal columns, exactly the one-tile Volta QPN band. Emit
+    // each 32-row CTA's top 16 order keys from the projection epilogue and merge those lists;
+    // avoid both the dense BF16 logits and a second full-vocabulary read.
+    if (profile == HeadProfile::Q4Optimized && hidden.ne[1] >= detail::kVoltaQpnMinT &&
+        hidden.ne[1] <= detail::kVoltaQpnMaxT) {
+        auto scope = workspace.scope();
+        auto topk_workspace = detail::allocate_linear_topk_workspace(
+            workspace, head.n, hidden.ne[1], detail::kVoltaQpnRowsPerTopKProducer);
+        detail::launch_q4_volta_qpn_topk(
+            hidden, head, *id_map,
+            static_cast<std::uint64_t*>(topk_workspace.partial_keys.data),
+            topk_workspace.producer_groups, stream);
+        detail::linear_topk_merge_launch(topk_workspace, ids, scores, stream);
+        return;
+    }
+#endif
     // sm_70 port: materialize the head logits with the general linear op, then a single
     // top-16 selection kernel. The BF16 logit scratch is a rounding the fused kernel avoids.
     for (int first = 0; first < hidden.ne[1];) {
@@ -143,7 +163,18 @@ std::size_t linear_topk_workspace_capacity_bytes(QType qtype, std::int32_t head_
         throw std::invalid_argument("linear_topk workspace: invalid column interval");
     }
     const std::int32_t chunk = std::min(max_columns, detail::kLinearTopKMaxChunkColumns);
-    return static_cast<std::size_t>(head_rows) * chunk * sizeof(std::uint16_t);
+    std::size_t capacity = static_cast<std::size_t>(head_rows) * chunk * sizeof(std::uint16_t);
+#ifdef NINFER_VOLTA_BUILD
+    if (qtype == QType::Q4G64_F16S && head_rows == detail::kLinearTopKOptimizedRows &&
+        min_columns <= detail::kVoltaQpnMaxT && max_columns >= detail::kVoltaQpnMinT) {
+        const int columns = std::min(max_columns, detail::kVoltaQpnMaxT);
+        WorkspaceLayoutBuilder layout;
+        (void)detail::allocate_linear_topk_workspace(
+            layout, head_rows, columns, detail::kVoltaQpnRowsPerTopKProducer);
+        capacity = std::max(capacity, layout.peak_bytes());
+    }
+#endif
+    return capacity;
 }
 
 void linear_topk(const Tensor& hidden, const Weight& head, std::int32_t valid_rows,
