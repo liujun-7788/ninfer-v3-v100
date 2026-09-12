@@ -1,6 +1,7 @@
 #include "ops/dynamic_grouped_conv/w8/w8_dynamic_grouped_conv_add_plan.h"
 
 #include "ops/dynamic_grouped_conv/volta/dflash2_dynamic_conv_volta.h"
+#include "ops/linear/w8/w8_launch.h"
 #include "ninfer/ops/linear.h"
 
 #include <cstdint>
@@ -28,12 +29,16 @@ std::size_t w8_linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
         throw std::invalid_argument(
             "linear dynamic grouped conv add workspace: invalid W/B interval");
     (void)input_rows;
+    if (min_width == 8 && max_width == 8 && min_batch == 1 && max_batch == 1) { return 256; }
     // The projected BF16 [5120, W*B] materialization buffer.
     return static_cast<std::size_t>(kHidden) * max_width * max_batch * sizeof(std::uint16_t);
 }
 
 const char* w8_linear_dynamic_grouped_conv_add_route_name(int input_rows, int width, int batch) {
     require_profile(input_rows, width, batch);
+    if (width == 8 && batch == 1) {
+        return "dynamic_grouped_conv_add.w8.sm70.qpn_fused";
+    }
     return "dynamic_grouped_conv_add.w8.sm70.materialized_bf16";
 }
 
@@ -45,6 +50,15 @@ void w8_linear_dynamic_grouped_conv_add_dispatch(const Tensor& x, const Weight& 
     const int batch   = x.ne[2];
     const int columns = width * batch;
     require_profile(x.ne[0], width, batch);
+
+    if (width == 8 && batch == 1 &&
+        w8_volta_qpn_supported(kHidden, x.ne[0], columns)) {
+        auto scope = workspace.scope();
+        (void)workspace.alloc_bytes(256);
+        launch_w8_volta_qpn_dynamic_conv_add(x.view({x.ne[0], columns}), weight, base, delta,
+                                             residual, width, stream);
+        return;
+    }
 
     auto scope       = workspace.scope();
     Tensor projected = workspace.alloc(DType::BF16, {kHidden, columns});

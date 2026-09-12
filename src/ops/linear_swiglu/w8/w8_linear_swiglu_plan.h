@@ -24,6 +24,7 @@ enum class W8LinearSwiGluScheduleId {
     MmaR64C128,
     MmaR128C64,
     MmaR128C80,
+    VoltaQpnSplit,
     // DFlash2 draft MLP (34816x5120 -> 17408): materialize gate/up through the general W8
     // linear() then a fused SiLU-multiply. No dedicated fused Volta kernel yet.
     Materialized,

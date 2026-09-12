@@ -101,6 +101,8 @@ const char* w8_linear_swiglu_schedule_name(W8LinearSwiGluScheduleId schedule) no
         return "linear_swiglu.w8.simt.pair.c4";
     case W8LinearSwiGluScheduleId::SimtPairC8:
         return "linear_swiglu.w8.simt.pair.c8";
+    case W8LinearSwiGluScheduleId::VoltaQpnSplit:
+        return "linear_swiglu.w8.sm70.qpn.split";
     case W8LinearSwiGluScheduleId::SplitKMmaExactT:
         return "linear_swiglu.w8.splitk.mma.pair.exact_t";
     case W8LinearSwiGluScheduleId::MmaR32C64:
@@ -142,6 +144,9 @@ std::size_t w8_linear_swiglu_capacity_workspace_bytes(std::int32_t gate_up_rows,
     (void)w8_linear_swiglu_resolve_plan(lo);
     (void)w8_linear_swiglu_resolve_plan(hi);
     if (!is_dflash2_shape(hi)) { return 0; }
+#ifdef NINFER_VOLTA_BUILD
+    if (min_tokens >= 5 && max_tokens <= 8) { return 256; }
+#endif
     return materialized_workspace_bytes(gate_up_rows, max_tokens);
 }
 
@@ -154,7 +159,14 @@ W8LinearSwiGluPlan w8_linear_swiglu_resolve_plan(const W8LinearSwiGluProblem& pr
         throw std::invalid_argument(
             "W8 LinearSwiGLU: exact problem or column count is not admitted");
     }
-    if (is_dflash2_shape(problem)) { return {W8LinearSwiGluScheduleId::Materialized}; }
+    if (is_dflash2_shape(problem)) {
+#ifdef NINFER_VOLTA_BUILD
+        if (problem.cols >= 5 && problem.cols <= 8) {
+            return {W8LinearSwiGluScheduleId::VoltaQpnSplit};
+        }
+#endif
+        return {W8LinearSwiGluScheduleId::Materialized};
+    }
     for (const RouteSpec& route : kRoutes) {
         if (problem.cols >= route.first && problem.cols <= route.last) { return {route.schedule}; }
     }
@@ -176,6 +188,12 @@ void w8_linear_swiglu_execute_plan(const W8LinearSwiGluPlan& plan, const Tensor&
                  gate_up.slice(0, problem.output_rows, problem.output_rows), out, stream);
         return;
     }
+    if (plan.schedule == W8LinearSwiGluScheduleId::VoltaQpnSplit) {
+        auto scope = ws.scope();
+        (void)ws.alloc_bytes(256);
+        w8_linear_swiglu_volta_qpn_split_launch(x, w, out, stream);
+        return;
+    }
     switch (plan.schedule) {
     case W8LinearSwiGluScheduleId::DecodePairR16:
         w8_linear_swiglu_decode_pair_r16_launch(x, w, out, stream);
@@ -186,6 +204,8 @@ void w8_linear_swiglu_execute_plan(const W8LinearSwiGluPlan& plan, const Tensor&
     case W8LinearSwiGluScheduleId::SimtPairC8:
         w8_linear_swiglu_simt_pair_c8_launch(x, w, out, stream);
         return;
+    case W8LinearSwiGluScheduleId::VoltaQpnSplit:
+        break; // handled above
     case W8LinearSwiGluScheduleId::SplitKMmaExactT:
         w8_linear_swiglu_splitk_exact_t_launch(x, w, out, stream);
         return;

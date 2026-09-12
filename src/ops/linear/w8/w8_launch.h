@@ -21,6 +21,10 @@ void launch_w8_volta_mma(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 // Quadpair-split-N form (w8_volta_qpn_gemm.cuh), for the narrow verify widths the 32x8 route
 // pads its A rows away on. Also workspace-free: the CTA's warps split K and reduce in shared.
 void launch_w8_volta_qpn(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+void launch_w8_volta_qpn_dynamic_conv_add(const Tensor& x, const Weight& weight,
+                                          const Tensor& base, const Tensor& finish_delta,
+                                          Tensor& residual, std::int32_t width,
+                                          cudaStream_t stream);
 [[nodiscard]] bool w8_volta_qpn_supported(std::int32_t n, std::int32_t k,
                                           std::int32_t t) noexcept;
 #endif
