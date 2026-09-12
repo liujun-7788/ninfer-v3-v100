@@ -78,7 +78,11 @@ template <class Allocator>
 PartialWorkspace allocate_workspace(Allocator& workspace, std::int32_t tokens, std::int32_t splits,
                                     std::int32_t batch_size) {
     return {
+#ifdef NINFER_VOLTA_BUILD
+        workspace.alloc(DType::FP32, {kHeadDim, kQHeads, tokens, splits * batch_size}),
+#else
         workspace.alloc(DType::BF16, {kHeadDim, kQHeads, tokens, splits * batch_size}),
+#endif
         workspace.alloc(DType::FP32, {kQHeads, tokens, splits * batch_size}),
         workspace.alloc(DType::FP32, {kQHeads, tokens, splits * batch_size}),
     };

@@ -62,9 +62,9 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__
         max_context, split_capacity, scale, partial_acc, partial_m, partial_l, out);
 }
 
-template <int Tokens, int KeyBlock, int WarpsPerBlock>
+template <int Tokens, int KeyBlock, int WarpsPerBlock, typename Partial = __nv_bfloat16>
 __launch_bounds__(WarpsPerBlock * 32, 2) __global__
-    void sliding_window_attention_reduce_kernel(const __nv_bfloat16* __restrict__ partial_acc,
+    void sliding_window_attention_reduce_kernel(const Partial* __restrict__ partial_acc,
                                                 const float* __restrict__ partial_m,
                                                 const float* __restrict__ partial_l,
                                                 const std::int32_t* __restrict__ positions,
@@ -127,10 +127,13 @@ __launch_bounds__(WarpsPerBlock * 32, 2) __global__
         const int d     = lane + item * 32;
         float numerator = 0.0f;
         for (int split = 0; split < active_splits; ++split) {
-            numerator +=
-                __bfloat162float(
-                    partial_acc[context_query_partial_index<Tokens>(q_head, d, token, split)]) *
-                weights[warp][split];
+            const auto index = context_query_partial_index<Tokens>(q_head, d, token, split);
+            float partial;
+            if constexpr (std::is_same_v<Partial, float>)
+                partial = partial_acc[index];
+            else
+                partial = __bfloat162float(partial_acc[index]);
+            numerator += partial * weights[warp][split];
         }
         const float value = global_l > 0.0f ? numerator / global_l : 0.0f;
         out[context_query_q_index(q_head, d, token)] = __float2bfloat16(value);
