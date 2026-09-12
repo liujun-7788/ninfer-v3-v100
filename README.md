@@ -72,9 +72,11 @@ corpus-continuation shape (a 3-10 sweep falls off on both sides); MTP still lead
 every K tried.
 
 The Qwen3.8-27B artifacts also bundle DFlash2, the upstream masked-block speculative decoder
-(`--spec dflash2`); the sweep above uses MTP, which remains the recommended Volta backend for
-general decoding, while DFlash2's heavier draft is strongest on long-context context-referential
-generation.
+(`--spec dflash2`). MTP remains the recommended Volta backend for general decoding. On a varied,
+non-repetitive corpus, DFlash2 K=7 narrowly beat the best MTP window at 2K and 32K context, while
+MTP led at 8K, 16K, and 150K. DFlash2 K=7 is its strongest static default; acceptance-driven
+window adaptation can favor K=3 on difficult continuations. See the full comparison in the
+[V100 port notes](docs/v100.md#varied-context-dflash2-sweep).
 
 MTP automatically extends verification up to fifteen draft tokens when the generated suffix
 exactly matches an earlier 16-token span and the learned proposal agrees with the lookup
