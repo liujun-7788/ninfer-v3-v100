@@ -136,6 +136,7 @@ int main() {
     int failures = 0;
     failures += run_case(1, 1, {0});
     failures += run_case(5, 5, {0, 2, 5});
+    failures += run_case(15, 1, {0, 1, 7, 15});
     failures += run_case(15, 5, {0, 7, 15});
 
     if (failures != 0) {

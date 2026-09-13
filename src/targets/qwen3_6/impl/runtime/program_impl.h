@@ -11262,7 +11262,11 @@ void ProgramImplCore::prepare_graphs() {
             }
         }
 
-        constexpr std::uint32_t lookup_k = qwen3_6::kMtpLookupMaximumDrafts;
+        constexpr std::uint32_t lookup_k          = qwen3_6::kMtpLookupMaximumDrafts;
+        // Lookup supplies the wide target proposal.  Retain one learned draft only as the
+        // next-round agreement guard; regenerating the configured window here needlessly ran
+        // the autoregressive MTP tail while a copied continuation remained valid.
+        constexpr std::uint32_t lookup_proposal_k = 1;
         const auto lookup_profiles       = mtp_graph_profiles(capacity, lookup_k);
         validate_graph_profiles(lookup_profiles, capacity - 1, "MTP lookup");
         schedule::MtpBatchContext lookup_state{execution_core(&*mtp_lookup_replay_records),
@@ -11283,8 +11287,10 @@ void ProgramImplCore::prepare_graphs() {
                 profile.topology_class =
                     planned.topology_class * max_concurrency + (batch_size - 1U);
                 schedule::capture_mtp_decode_batch(
-                    lookup_state, static_cast<std::int32_t>(batch_size), lookup_k, draft_window,
-                    mtp_causal_attention_envelopes(planned.max, lookup_k, draft_window, capacity),
+                    lookup_state, static_cast<std::int32_t>(batch_size), lookup_k,
+                    lookup_proposal_k,
+                    mtp_causal_attention_envelopes(planned.max, lookup_k, lookup_proposal_k,
+                                                   capacity),
                     profile.definition);
             }
         }
@@ -11998,8 +12004,10 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                       capacity - sequence.execution_frontier - 1});
         const auto found = lookup_draft(sequence.ledger);
         const bool agrees_with_mtp =
-            found && sequence.mtp_draft_count == draft_window &&
-            std::equal(found->begin(), found->begin() + static_cast<std::ptrdiff_t>(draft_window),
+            found && sequence.mtp_draft_count > 0 &&
+            std::equal(found->begin(),
+                       found->begin() +
+                           static_cast<std::ptrdiff_t>(sequence.mtp_draft_count),
                        sequence.mtp_drafts.begin());
         if (!agrees_with_mtp || max_lookup_extent <= draft_window) {
             use_lookup = false;
@@ -12010,6 +12018,7 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
 
     const std::uint32_t verify_k =
         use_lookup ? qwen3_6::kMtpLookupMaximumDrafts : draft_window;
+    const std::uint32_t proposal_k = use_lookup ? 1U : draft_window;
     const std::uint32_t width = verify_k + 1;
     qwen3_6::MtpDecodeState& frame =
         use_lookup ? *io.mtp_lookup_decode : *io.mtp_decode;
@@ -12022,14 +12031,14 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                              static_cast<std::uint64_t>(lanes.size()));
         DecodeGraphExecutable* executable = nullptr;
         schedule::MtpCausalAttentionEnvelopes envelopes =
-            mtp_causal_attention_envelopes(maximum_frontier, verify_k, draft_window, capacity);
+            mtp_causal_attention_envelopes(maximum_frontier, verify_k, proposal_k, capacity);
         if (use_cuda_graph) {
             DecodeGraphProfile& profile =
                 select_graph_profile(graph_family, static_cast<std::uint32_t>(lanes.size()),
                                      maximum_frontier, "MTP batch");
             executable = &install_graph_profile(graph_family, profile, "MTP batch");
             envelopes = mtp_causal_attention_envelopes(
-                profile.max_execution_frontier, verify_k, draft_window, capacity);
+                profile.max_execution_frontier, verify_k, proposal_k, capacity);
         }
 
         *mtp_host_ingress = {};
@@ -12093,7 +12102,7 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
 
         mark_workspace_usage(workspace_plan.mtp_round);
         schedule::mtp_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
-                                   verify_k, draft_window, envelopes, executable);
+                                   verify_k, proposal_k, envelopes, executable);
         submit_range.reset();
         timing.begin_wait();
         {
@@ -12114,7 +12123,7 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             const std::int32_t next_i     = mtp_host_egress->next_extents[row];
             if (count_i <= 0 || count_i > static_cast<std::int32_t>(width) || accepted_i < 0 ||
                 accepted_i + 1 != count_i || next_i < 0 ||
-                next_i > static_cast<std::int32_t>(draft_window) ||
+                next_i > static_cast<std::int32_t>(proposal_k) ||
                 static_cast<std::uint32_t>(count_i) > budgets[row].generated_tokens_remaining ||
                 static_cast<std::uint64_t>(base_E) + static_cast<std::uint32_t>(count_i) >
                     capacity) {

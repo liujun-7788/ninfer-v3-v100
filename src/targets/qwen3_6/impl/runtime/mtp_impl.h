@@ -114,9 +114,14 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size,
         Tensor alignment_hidden   = frame.alignment_hidden.slice(2, 0, batch_size);
         Tensor ar_hidden          = frame.ar_hidden.slice(1, 0, batch_size);
         Tensor next_hidden        = frame.next_hidden.slice(1, 0, batch_size);
-        Tensor ar_positions       = frame.ar_positions.slice(0, 0, batch_size);
-        Tensor ar_rope_positions  = frame.ar_rope_positions.slice(0, 0, batch_size);
-        Tensor ar_valid_columns   = frame.ar_valid_columns.slice(0, 0, batch_size);
+        const std::int32_t ar_steps =
+            static_cast<std::int32_t>(std::max(proposal_k - 1U, 1U));
+        Tensor ar_positions =
+            frame.ar_positions.slice(0, 0, batch_size).slice(1, 0, ar_steps);
+        Tensor ar_rope_positions =
+            frame.ar_rope_positions.slice(0, 0, batch_size).slice(1, 0, ar_steps);
+        Tensor ar_valid_columns =
+            frame.ar_valid_columns.slice(0, 0, batch_size).slice(1, 0, ar_steps);
         Tensor next_drafts        = frame.next_drafts.slice(0, 0, batch_size);
 
         ops::speculative_prepare_verify_inputs(anchors, current_drafts, frontiers, current_extents,
