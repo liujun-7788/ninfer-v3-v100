@@ -287,6 +287,16 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output, DeviceSpa
     const auto tokens   = static_cast<std::int32_t>(tokens64);
     cudaStream_t stream = ctx_.stream;
 
+    // Normal image widths provide enough independent output CTAs for the Volta fused-dequant
+    // GEMMs to use one K split and therefore no accumulator storage. Supplying a deliberately
+    // tiny arena enables those zero-workspace routes while narrower split-K cases fall back
+    // safely. The arena may alias backing because a selected route cannot allocate from it.
+    WorkspaceArena linear_workspace(
+        DeviceSpan{backing.data, std::min<std::size_t>(backing.bytes, kWorkspaceAlignment)});
+    const auto linear = [&](const Tensor& input, const Weight& weight, Tensor& result) {
+        ops::linear(input, weight, result, ops::LinearPolicy::A16Only, linear_workspace, stream);
+    };
+
     Tensor position_ids = layout.position_ids.bind(backing);
     Tensor x            = layout.x.bind(backing);
     Tensor patch_bf16   = layout.patch_bf16.bind(backing);
@@ -297,7 +307,7 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output, DeviceSpa
                                       static_cast<std::uint64_t>(patches64));
         copy_host(control.position_ids.data(), position_ids, stream);
         copy_host(item.patches.data(), patch_bf16, stream);
-        ops::linear(patch_bf16, *patch_embed_, x, stream);
+        linear(patch_bf16, *patch_embed_, x);
         ops::add_bias(*patch_embed_bias_, x, stream);
         // The artifact records the source table shape [rows,hidden], while Tensor's
         // contiguous matrix convention is [inner,columns]. The payload is already
@@ -323,7 +333,7 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output, DeviceSpa
                     Tensor h = layout.attention_norm.bind(backing);
                     ops::layer_norm(x, *block.norm1_weight, *block.norm1_bias,
                                     VisionScheduleConfig::norm_eps, h, stream);
-                    ops::linear(h, *block.qkv, qkv, stream);
+                    linear(h, *block.qkv, qkv);
                 }
                 ops::add_bias(*block.qkv_bias, qkv, stream);
                 const std::int32_t plane      = VisionScheduleConfig::hidden;
@@ -349,7 +359,7 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output, DeviceSpa
                                               control.segment_length, attended_heads, stream);
             }
             Tensor projected = layout.projected.bind(backing);
-            ops::linear(attended, *block.projection, projected, stream);
+            linear(attended, *block.projection, projected);
             ops::add_bias(*block.projection_bias, projected, stream);
             ops::residual_add(projected, x, stream);
         }
@@ -362,11 +372,11 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output, DeviceSpa
                 Tensor h = layout.mlp_norm.bind(backing);
                 ops::layer_norm(x, *block.norm2_weight, *block.norm2_bias,
                                 VisionScheduleConfig::norm_eps, h, stream);
-                ops::linear(h, *block.fc1, up, stream);
+                linear(h, *block.fc1, up);
             }
             ops::add_bias(*block.fc1_bias, up, stream);
             ops::gelu(up, ops::GeluMode::Tanh, stream);
-            ops::linear(up, *block.fc2, down, stream);
+            linear(up, *block.fc2, down);
             ops::add_bias(*block.fc2_bias, down, stream);
             ops::residual_add(down, x, stream);
         }
@@ -380,10 +390,10 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output, DeviceSpa
                         normalized, stream);
         Tensor merged = normalized.view({VisionScheduleConfig::merger_hidden, tokens});
         Tensor hidden = layout.merger_hidden.bind(backing);
-        ops::linear(merged, *merger_.fc1, hidden, stream);
+        linear(merged, *merger_.fc1, hidden);
         ops::add_bias(*merger_.fc1_bias, hidden, stream);
         ops::gelu(hidden, ops::GeluMode::Exact, stream);
-        ops::linear(hidden, *merger_.fc2, output, stream);
+        linear(hidden, *merger_.fc2, output);
         ops::add_bias(*merger_.fc2_bias, output, stream);
     }
 }

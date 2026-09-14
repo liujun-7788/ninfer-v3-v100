@@ -122,7 +122,25 @@ Q5Launch select_q5_launch(std::int32_t n, std::int32_t k, std::int32_t t, Linear
 }
 
 void q5_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
-                 cudaStream_t stream) {
+                 WorkspaceArena* workspace, cudaStream_t stream) {
+#ifdef NINFER_VOLTA_BUILD
+    const std::int32_t t = x.ne[1];
+    // Basic Linear historically had no Q5 Volta-MMA route because split-K needs caller-owned
+    // accumulation storage. Large vision matrices provide enough CTAs to select one split, which
+    // stores directly to BF16 output, so admit exactly that zero-workspace case here.
+    if (workspace != nullptr && t >= 9 &&
+        (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8) &&
+        q5_volta_mma_supported(out.ne[0], x.ne[0], t)) {
+        const std::size_t need = q5_volta_mma_workspace_bytes(out.ne[0], x.ne[0], t);
+        if (need == 0) {
+            launch_q5_volta_mma(x, w, out, /*add_residual=*/false,
+                                /*weight_row_offset=*/0, *workspace, stream);
+            return;
+        }
+    }
+#else
+    (void)workspace;
+#endif
     const Q5Launch launch = select_q5_launch(w.n, w.k, x.ne[1], policy);
     launch(x, w, out, stream);
 }

@@ -120,10 +120,10 @@ Q4Launch select_q4_launch(std::int32_t n, std::int32_t k, std::int32_t t, Linear
 // 93.2us, then T=9 129.0 vs ~93, T=12 146.4 vs 95.2, T=32 259.1 vs 110.6. T=8 is the only point
 // SIMT wins, because it is exactly one eight-column tile; from T=9 it pays a second, mostly empty
 // tile while the fused route is nearly flat in T.
-// Upper bound keeps the fp32 split-K buffer bounded (n*T*4 bytes; 8.9 MB at the widest Q4 shape)
-// and covers the whole concurrency range, since MTP3 puts C8 at T=32 and C16 at T=64.
+// Split-K is retained only through T=64, keeping its fp32 buffer bounded. Wider problems may use
+// this route only once their output grid is large enough to require one split and no workspace.
 constexpr std::int32_t kVoltaMmaMinT = 9;
-constexpr std::int32_t kVoltaMmaMaxT = 64;
+constexpr std::int32_t kVoltaMmaSplitKMaxT = 64;
 
 #endif
 
@@ -139,14 +139,15 @@ void q4_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy pol
         launch_q4_volta_qpn(x, w, out, stream);
         return;
     }
-    if (workspace != nullptr && t >= kVoltaMmaMinT && t <= kVoltaMmaMaxT &&
+    if (workspace != nullptr && t >= kVoltaMmaMinT &&
         (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8) &&
         q4_volta_mma_supported(out.ne[0], x.ne[0], t)) {
         // Fall back rather than trust the caller to have sized the arena: linear's workspace
         // contract predates this route, so a caller that sized for the old zero-byte Q4
         // requirement must degrade to SIMT, not overrun.
         const std::size_t need = q4_volta_mma_workspace_bytes(out.ne[0], x.ne[0], t);
-        if (workspace->capacity() - workspace->used() >= need) {
+        if ((need == 0 || t <= kVoltaMmaSplitKMaxT) &&
+            workspace->capacity() - workspace->used() >= need) {
             launch_q4_volta_mma(x, w, out, *workspace, stream);
             return;
         }

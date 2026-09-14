@@ -40,7 +40,9 @@ void packed_attention_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                              const Tensor& cu_seqlens, Tensor* tiles, Tensor& out,
                              cudaStream_t stream) {
 #ifdef NINFER_VOLTA_BUILD
-    const dim3 grid(static_cast<unsigned>(q.ne[2]), kPackedAttentionHeads, 1u);
+    const dim3 grid(static_cast<unsigned>((q.ne[2] + kPackedAttentionVoltaQueriesPerBlock - 1) /
+                                         kPackedAttentionVoltaQueriesPerBlock),
+                    kPackedAttentionHeads, 1u);
     packed_attention_volta_kernel<<<grid, kPackedAttentionVoltaThreads, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(q.data), static_cast<const __nv_bfloat16*>(k.data),
         static_cast<const __nv_bfloat16*>(v.data),
@@ -93,7 +95,9 @@ void packed_attention_uniform_launch_with_tile(const Tensor& q, const Tensor& k,
                                                std::int32_t segment_length, std::int32_t tile_size,
                                                Tensor& out, cudaStream_t stream) {
 #ifdef NINFER_VOLTA_BUILD
-    const dim3 grid(static_cast<unsigned>(q.ne[2]), kPackedAttentionHeads, 1u);
+    const dim3 grid(static_cast<unsigned>((q.ne[2] + kPackedAttentionVoltaQueriesPerBlock - 1) /
+                                         kPackedAttentionVoltaQueriesPerBlock),
+                    kPackedAttentionHeads, 1u);
     packed_attention_volta_kernel<<<grid, kPackedAttentionVoltaThreads, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(q.data), static_cast<const __nv_bfloat16*>(k.data),
         static_cast<const __nv_bfloat16*>(v.data), nullptr, 0, segment_length, q.ne[2],
