@@ -1,3 +1,5 @@
+**English** | [简体中文](README.zh-CN.md)
+
 > **ninfer-v3-v100** — a maintained fork of [geoffwatts/ninfer-v100](https://github.com/geoffwatts/ninfer-v100) (the Tesla V100 fork of [Neroued/ninfer](https://github.com/Neroued/ninfer)) that adds **direct support for upstream v3 `.ninfer` artifacts** — official downloads such as [neroued/Qwen3.8-27B-nvfp4-NInfer](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer) run without conversion. For the verified V100 build recipe, runtime flags, and MTP benchmark data see [docs/V100-BUILD.md](docs/V100-BUILD.md). This fork is not affiliated with or endorsed by the upstream authors.
 
 # NInfer
