@@ -1,3 +1,5 @@
+**English** | [简体中文](V100-BUILD.zh-CN.md)
+
 # Building and running NInfer on Tesla V100 (sm_70) — verified recipe
 
 This guide reflects a build that is actually running in production on a
