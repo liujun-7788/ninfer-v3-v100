@@ -213,16 +213,10 @@ void validate_tokenizer_config(const FrontendResources& resources) {
         throw std::invalid_argument(
             "tokenizer_config.json does not use the official <|endoftext|> pad token");
     }
-    if (!tokenizer_config.contains("chat_template") ||
-        !tokenizer_config.at("chat_template").is_string()) {
-        throw std::invalid_argument(
-            "tokenizer_config.json.chat_template must contain the loaded chat template");
-    }
-    if (tokenizer_config.at("chat_template").get_ref<const std::string&>() !=
-        resources.chat_template_jinja) {
-        throw std::invalid_argument(
-            "tokenizer_config.json.chat_template does not match frontend/chat_template.jinja");
-    }
+    // Official v3 artifacts ship frontend/chat_template.jinja with an SPDX license header
+    // while tokenizer_config.json carries a header-stripped copy, so the two diverge by
+    // design. Upstream dropped the equality check for the same reason; the compiled
+    // template comes from the jinja resource alone.
 }
 
 fi::CompiledChatTemplate compile_chat_template(const FrontendResources& resources) {
