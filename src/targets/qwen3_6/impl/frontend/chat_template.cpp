@@ -412,7 +412,26 @@ RenderedFragment ChatMessage::rendered_content(bool add_vision_id, int* image_co
 }
 
 CompiledChatTemplate CompiledChatTemplate::resolve(std::string_view source) {
-    const Sha256Digest digest = sha256(source);
+    // Official v3 artifacts prepend an SPDX license comment block (jinja `{# ... #}`) to
+    // frontend/chat_template.jinja; the template body is otherwise byte-identical to the
+    // registered semantics. Comments carry no semantics, so strip leading comment blocks
+    // (and surrounding whitespace) before fingerprinting.
+    std::size_t pos = 0;
+    while (true) {
+        while (pos < source.size() &&
+               (source[pos] == ' ' || source[pos] == '\n' || source[pos] == '\r' ||
+                source[pos] == '\t')) {
+            ++pos;
+        }
+        if (pos + 1 < source.size() && source[pos] == '{' && source[pos + 1] == '#') {
+            const std::size_t end = source.find("#}", pos + 2);
+            if (end == std::string_view::npos) { break; }
+            pos = end + 2;
+            continue;
+        }
+        break;
+    }
+    const Sha256Digest digest = sha256(source.substr(pos));
     if (digest == kThinkingToggleTemplateDigest) {
         return CompiledChatTemplate(ChatTemplateSemantics::ThinkingToggle);
     }
