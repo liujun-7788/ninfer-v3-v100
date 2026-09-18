@@ -33,7 +33,14 @@ docker build -t ninfer-v100 .
 ```
 
 The base image (`nvidia/cuda:12.8.1-runtime-ubuntu24.04`, ~3 GB) is pulled
-from Docker Hub on first build.
+from Docker Hub on first build. If Docker Hub is unreachable from your
+network (common on CN servers), pull it through a mirror and retag:
+
+```bash
+docker pull docker.m.daocloud.io/nvidia/cuda:12.8.1-runtime-ubuntu24.04
+docker tag docker.m.daocloud.io/nvidia/cuda:12.8.1-runtime-ubuntu24.04 \
+    nvidia/cuda:12.8.1-runtime-ubuntu24.04
+```
 
 ## Step 3 — run
 
@@ -136,7 +143,14 @@ docker build -t ninfer-v100 .
 ```
 
 首次构建会从 Docker Hub 拉取基础镜像（`nvidia/cuda:12.8.1-runtime-ubuntu24.04`，
-约 3 GB）。
+约 3 GB）。若你的网络访问不了 Docker Hub（国内服务器常见），走镜像源拉取
+后改名即可：
+
+```bash
+docker pull docker.m.daocloud.io/nvidia/cuda:12.8.1-runtime-ubuntu24.04
+docker tag docker.m.daocloud.io/nvidia/cuda:12.8.1-runtime-ubuntu24.04 \
+    nvidia/cuda:12.8.1-runtime-ubuntu24.04
+```
 
 ## 第 3 步 — 运行
 
