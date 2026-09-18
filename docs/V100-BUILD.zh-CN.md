@@ -94,7 +94,7 @@ Volta 上的 KV dtype 指南（每 token 每 256 维 head 的实测字节数，K
 |---|---:|---|
 | `bf16` | 1024 | 上游默认；在 32GB 卡上很浪费 |
 | `int8` | 528 | **我们在用的**；上述配方下 KV 池 230,208 token |
-| `fp8` | 516 | 速度与 int8 无差异；池能到 **263,360 token（+14.4%）**——需要更长窗口就选它 |
+| `fp8` | 516 | 池能到 **263,424 token（+14.4%）**，但**真实业务负载下 decode 明显慢于 int8**（仅小探针基准看不出差距）——除非必须更长窗口且能接受速度损失，否则不建议 |
 | `k8v4` / `nvfp4` | — | **Volta 上规划阶段直接拒绝**（`NVFP4 KV-cache storage is unavailable on Volta`），虽然命令行接受这些值 |
 
 该配方实测数据（128 token 补全，丢弃 1 次 warmup + 3 次重复），各上下文
@@ -125,3 +125,10 @@ Volta 上的 KV dtype 指南（每 token 每 256 维 head 的实测字节数，K
 官方上游 v3 工件可用本分支直接加载，例如
 [neroued/Qwen3.8-27B-nvfp4-NInfer](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer)。
 v2 工件（magic `NInfer\0\2`）照常工作，无需任何改动。
+
+## Docker 部署
+
+预编译二进制的运行镜像见 [`docker/README.md`](../docker/README.md)：下载
+Release 压缩包 → `docker build -t ninfer-v100 .` → 一条 `docker run --gpus all`
+（或 `docker compose up -d`）。Windows 宿主机经 Docker Desktop（WSL2 后端）
+跑法完全相同。V100 (sm_70) 的要求不变。

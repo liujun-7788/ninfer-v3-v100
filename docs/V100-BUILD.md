@@ -119,7 +119,7 @@ KV dtype guide on Volta (measured bytes per token per 256-dim head, K+V):
 |---|---:|---|
 | `bf16` | 1024 | upstream default; wasteful on 32 GB cards |
 | `int8` | 528 | **what we run**; 230,208-token pool at the recipe above |
-| `fp8` | 516 | same speed as int8 within noise; fits **263,360 tokens (+14.4%)** — pick it when you need a bigger window |
+| `fp8` | 516 | fits **263,424 tokens (+14.4%)**, but **decode measurably slower than int8 under real workloads** (only a tiny-probe benchmark missed this) — use it only if you must have the bigger window and accept the speed loss |
 | `k8v4` / `nvfp4` | — | **rejected on Volta at planning time** (`NVFP4 KV-cache storage is unavailable on Volta`) even though the CLI accepts the values |
 
 Measured at this recipe (128-token completions, 1 discarded warmup + 3
@@ -163,3 +163,11 @@ repeats), prefill / decode tok/s by context:
 Official upstream v3 artifacts load directly with this fork, e.g.
 [neroued/Qwen3.8-27B-nvfp4-NInfer](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer).
 v2 artifacts (magic `NInfer\0\2`) keep working unchanged.
+
+## Docker
+
+A runtime image with the prebuilt server binary is documented in
+[`docker/README.md`](../docker/README.md): download the release tarball,
+`docker build -t ninfer-v100 .`, then one `docker run --gpus all` (or
+`docker compose up -d`). Windows hosts work the same way via Docker Desktop
+(WSL2 backend). The V100 (sm_70) requirement is unchanged.
