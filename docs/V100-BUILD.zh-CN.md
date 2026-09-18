@@ -62,16 +62,48 @@ cmake --build build-v100 -j$(nproc)
 
 ## V100 上重要的运行参数
 
-我们每天运行的生产线（Qwen3.8-27B NVFP4，官方 v3 工件）：
+我们每天运行的生产线（V100-PCIE-32GB 实测验证：Qwen3.8-27B NVFP4，官方 v3 工件，开启视觉，2 路并发）：
 
 ```bash
 build-v100/apps/ninfer-serve /path/to/qwen3_8_27b_nvfp4.ninfer \
-  --host 127.0.0.1 --port 7105 --device 0 --model-id qwen3.8-27b \
-  --max-context 131072 --kv-capacity auto --max-concurrency 1 \
-  --kv-dtype int8 --device-state-slots 1 --host-state-slots 8 \
+  --host 0.0.0.0 --port 7106 --device 1 --model-id qwen3.8-27b \
+  --max-context 230000 --kv-capacity auto --max-concurrency 2 \
+  --kv-dtype int8 --device-state-slots 2 --host-state-slots 8 \
   --host-kv-mib 8192 --spec mtp --draft-tokens 3 --lm-head-draft \
-  --preserve-thinking --pending-timeout-ms 600000
+  --preserve-thinking --pending-timeout-ms 600000 --vision --log-level info
 ```
+
+这是 **32GB 卡在开启视觉 + 2 路并发下能装下的最大上下文**：230000 对应
+230,208 token 的 KV 池，只剩约 10 MB 余量。`--max-context 240000` 会规划
+失败（比权重载入后的剩余显存还差约 1.68 GiB）；如果卡上还跑别的东西，请
+降到 220000/200000。
+
+强烈建议的主机设置（实测有效，不是玄学）：
+
+```bash
+sudo nvidia-smi -pm 1                      # 持久模式
+sudo nvidia-smi -lgc 1380,1380 -i <gpu>    # 把 SM 时钟锁在最高加速频率
+```
+
+不做这两步时，我们实测持续 decode 下 SM 会漂到约 1245 MHz（比 1380 MHz
+加速时钟低 10%）——ITL 直接损失一成，还带 DVFS 引起的逐 token 抖动。
+
+Volta 上的 KV dtype 指南（每 token 每 256 维 head 的实测字节数，K+V）：
+
+| `--kv-dtype` | 字节 | 说明 |
+|---|---:|---|
+| `bf16` | 1024 | 上游默认；在 32GB 卡上很浪费 |
+| `int8` | 528 | **我们在用的**；上述配方下 KV 池 230,208 token |
+| `fp8` | 516 | 速度与 int8 无差异；池能到 **263,360 token（+14.4%）**——需要更长窗口就选它 |
+| `k8v4` / `nvfp4` | — | **Volta 上规划阶段直接拒绝**（`NVFP4 KV-cache storage is unavailable on Volta`），虽然命令行接受这些值 |
+
+该配方实测数据（128 token 补全，丢弃 1 次 warmup + 3 次重复），各上下文
+档位的 prefill / decode tok/s：
+
+| ctx | 2K | 8K | 16K | 32K | 64K | 128K |
+|---|---:|---:|---:|---:|---:|---:|
+| prefill | 1043 | 1070 | 1012 | 907 | 737 | 526 |
+| decode | 96 | 105 | 104 | 69 | 73 | 45 |
 
 - **CUDA Graphs 在 V100 上可用**（这套设置下捕获约 0.3–0.7 秒）。如果捕获 OOM，说明你的 KV 预算对剩余显存太激进：先降 `--max-context`；万不得已才退到 `--no-cuda-graph`。
 - **MTP 草稿 token 数（K）。** 我们在 Qwen3.8-27B NVFP4 上用真实 HTTP 负载扫了 K=2..5（上下文 2K/8K/32K/64K/128K，各 3 次重复，各 K 使用完全相同的提示）：
