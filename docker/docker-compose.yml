@@ -1,0 +1,27 @@
+services:
+  ninfer:
+    build: .
+    image: ninfer-v100:latest
+    container_name: ninfer-v100
+    ports:
+      - "7106:7106"
+    environment:
+      API_KEY: "sk-change-me"
+      # --- all knobs below are optional; defaults = the verified recipe ---
+      # MAX_CONTEXT: "230000"      # lower (e.g. 200000) if VRAM planning fails
+      # KV_DTYPE: "int8"           # int8 (recommended) | fp8 (bigger pool, slower decode)
+      # MAX_CONCURRENCY: "2"
+      # DRAFT_TOKENS: "3"
+      # VISION: "1"
+      # AUTO_DOWNLOAD: "0"         # "1" = download the model into ./models on first start
+      # HF_ENDPOINT: "https://hf-mirror.com"   # mirror for the model download (China)
+    volumes:
+      - ./models:/models
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
