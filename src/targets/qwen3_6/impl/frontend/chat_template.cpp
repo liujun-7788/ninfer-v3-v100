@@ -23,8 +23,20 @@ constexpr Sha256Digest kThinkingToggleTemplateDigest{
 };
 
 constexpr Sha256Digest kReasoningEffortTemplateDigest{
-    0xc3, 0xcf, 0x9e, 0x34, 0xab, 0xf4, 0xf9, 0xe3, 0x6c, 0x2d, 0x72, 0x16, 0x5a, 0xa9, 0xc1, 0x32,
-    0xd3, 0xe2, 0xa7, 0x25, 0xb6, 0xc2, 0x58, 0x6a, 0xaa, 0x3a, 0x8a, 0xf9, 0xd7, 0xa8, 0x10, 0x41,
+0xc3, 0xcf, 0x9e, 0x34, 0xab, 0xf4, 0xf9, 0xe3, 0x6c, 0x2d, 0x72, 0x16, 0x5a, 0xa9, 0xc1, 0x32,
+0xd3, 0xe2, 0xa7, 0x25, 0xb6, 0xc2, 0x58, 0x6a, 0xaa, 0x3a, 0x8a, 0xf9, 0xd7, 0xa8, 0x10, 0x41,
+};
+
+// Official v3 artifacts (Qwen3.8-27B-nvfp4-NInfer) ship a chat_template.jinja whose
+// license-stripped body is this digest. Diff against kReasoningEffortTemplateDigest:
+// developer-role instruction handling (the renderer already maps ChatRole::Developer to
+// the system header), a last_tool_index refinement for multi-step tool queries (the
+// renderer's trailing_tool_query already covers it), tolerant non-leading system
+// rendering (the renderer never raises), and continue_final_message plumbing (default
+// false; the serve layer never sets it). Semantics match ReasoningEffort.
+constexpr Sha256Digest kReasoningEffortV3TemplateDigest{
+0x4a, 0x8c, 0x12, 0x40, 0x7c, 0x02, 0xa9, 0xe1, 0x5c, 0x35, 0x3c, 0xda, 0x72, 0xf9, 0x4e, 0x10,
+0x39, 0x65, 0x57, 0x23, 0x5d, 0x0e, 0x73, 0x96, 0x0d, 0xaa, 0x42, 0x3f, 0xfc, 0x19, 0xe9, 0x89,
 };
 
 constexpr std::string_view kLowReasoningInstructions =
@@ -412,11 +424,33 @@ RenderedFragment ChatMessage::rendered_content(bool add_vision_id, int* image_co
 }
 
 CompiledChatTemplate CompiledChatTemplate::resolve(std::string_view source) {
-    const Sha256Digest digest = sha256(source);
+    // Official v3 artifacts prepend an SPDX license comment block (jinja `{# ... #}`) to
+    // frontend/chat_template.jinja; the template body is otherwise byte-identical to the
+    // registered semantics. Comments carry no semantics, so strip leading comment blocks
+    // (and surrounding whitespace) before fingerprinting.
+    std::size_t pos = 0;
+    while (true) {
+        while (pos < source.size() &&
+               (source[pos] == ' ' || source[pos] == '\n' || source[pos] == '\r' ||
+                source[pos] == '\t')) {
+            ++pos;
+        }
+        if (pos + 1 < source.size() && source[pos] == '{' && source[pos + 1] == '#') {
+            const std::size_t end = source.find("#}", pos + 2);
+            if (end == std::string_view::npos) { break; }
+            pos = end + 2;
+            continue;
+        }
+        break;
+    }
+    const Sha256Digest digest = sha256(source.substr(pos));
     if (digest == kThinkingToggleTemplateDigest) {
         return CompiledChatTemplate(ChatTemplateSemantics::ThinkingToggle);
     }
     if (digest == kReasoningEffortTemplateDigest) {
+        return CompiledChatTemplate(ChatTemplateSemantics::ReasoningEffort);
+    }
+    if (digest == kReasoningEffortV3TemplateDigest) {
         return CompiledChatTemplate(ChatTemplateSemantics::ReasoningEffort);
     }
     throw std::invalid_argument("unsupported frontend/chat_template.jinja (sha256 " +
@@ -706,3 +740,4 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
 }
 
 } // namespace ninfer::targets::qwen3_6::frontend_internal
+
