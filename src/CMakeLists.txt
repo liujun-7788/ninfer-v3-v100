@@ -18,6 +18,7 @@ add_library(ninfer_core STATIC
   core/arena.cu
   core/device.cu
   core/tp_group.cu
+  core/pp_link.cu
   core/dtype.cpp
   core/host_worker_pool.cpp
   core/gdn_replay_records.cpp
