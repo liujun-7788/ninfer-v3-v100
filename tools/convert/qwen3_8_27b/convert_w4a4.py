@@ -36,7 +36,6 @@ from tools.convert.qwen3_6.common import recipe as family_recipe
 from tools.convert.qwen3_6_27b import convert as family_config
 from tools.convert.qwen3_6_27b import draft_head
 
-from . import convert as base_convert
 from . import dflash2_recipe
 from . import inventory_w4a4 as inventory
 from . import recipe_w4a4 as recipe
@@ -100,7 +99,9 @@ def preflight_conversion(
         source = recipe.preflight_source_metadata(reader)
     dflash2_source = dflash2_recipe.preflight_sources(dflash2_model)
 
-    resources = base_convert.load_resources(model)
+    # Community checkpoint: load the same six frontend resources without the
+    # official-source SHA256 pinning applied by the stock loader.
+    resources = family_conversion.load_resources(model, inventory.RESOURCE_SPECS)
     resource_map = {resource.name: resource.data for resource in resources}
     object_plan = family_conversion.build_object_plan(
         inventory.OBJECT_SPECS, resource_map

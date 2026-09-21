@@ -494,7 +494,10 @@ def preflight_source_metadata(
     shards: set[str] = set()
     for name, (shape, dtype) in SOURCE_REQUIREMENTS.items():
         actual = metadata[name]
-        if actual.shape != shape or actual.dtype != dtype:
+        # Scalar globals are stored as shape [] in the ModelOpt 0.43 export
+        # and as [1] in the registered unsloth export; both mean FP32[1].
+        allowed = (shape, ()) if shape == (1,) else (shape,)
+        if actual.dtype != dtype or actual.shape not in allowed:
             raise ValueError(
                 f"{name}: source signature {(actual.shape, actual.dtype)} "
                 f"!= {(shape, dtype)}"
@@ -659,14 +662,15 @@ def materialize_nvfp4_weight(
         if len(scale_parts) == 1
         else torch.cat(scale_parts, dim=0)
     )
-    global_word = _same_word(
+    global_bits = _same_word(
         reader, recipe.divisor_sources, WEIGHT_GLOBAL_FIELD
     )
+    global_value = struct.unpack("<f", struct.pack("<I", global_bits))[0]
     _validate_global_word_choice(
-        recipe.divisor_sources[0], packed, scales, global_word
+        recipe.divisor_sources[0], packed, scales, global_value
     )
     divisor_bits = _reciprocal_bits(
-        global_word, recipe.divisor_sources[0].name
+        global_value, recipe.divisor_sources[0].name
     )
     if tuple(packed.shape) != (recipe.shape[0], recipe.shape[1] // 2) or tuple(
         scales.shape
@@ -681,8 +685,9 @@ def materialize_input_divisor(
     recipe: InputDivisorRecipe,
     reader: ShardReader,
 ) -> torch.Tensor:
-    word = _same_word(reader, recipe.sources, INPUT_GLOBAL_FIELD)
-    divisor_bits = _reciprocal_bits(word, recipe.sources[0].name)
+    bits = _same_word(reader, recipe.sources, INPUT_GLOBAL_FIELD)
+    value = struct.unpack("<f", struct.pack("<I", bits))[0]
+    divisor_bits = _reciprocal_bits(value, recipe.sources[0].name)
     return torch.frombuffer(
         bytearray(struct.pack("<I", divisor_bits)), dtype=torch.float32
     ).reshape(())
