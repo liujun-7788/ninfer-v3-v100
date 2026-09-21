@@ -195,6 +195,14 @@ public:
     DeviceKVPagePool(DeviceKVPagePool&&)                 = delete;
     DeviceKVPagePool& operator=(DeviceKVPagePool&&)      = delete;
 
+    // Pipeline mirroring: the mirror pool has identical capacity and page-id addressing (its
+    // planes may cover a different layer subset). Every allocation/free/data mutation on this
+    // pool replays on the mirror with the same page indices, so both pools evolve identical
+    // free lists and a block-table row built here is valid on both. Ownership (leases,
+    // reservations) stays with the primary; the mirror is never handed out.
+    void set_mirror(DeviceKVPagePool& mirror);
+    [[nodiscard]] bool has_mirror() const noexcept { return mirror_ != nullptr; }
+
     [[nodiscard]] const KVPageGeometry& geometry() const noexcept { return spec_.geometry; }
 
     [[nodiscard]] std::uint32_t capacity_pages() const noexcept;
@@ -251,12 +259,17 @@ private:
     void release_page(std::int32_t index, std::uint32_t generation) noexcept;
     void release_reservation(std::uint32_t pages) noexcept;
 
+    // Mirror-side raw operations: apply a primary pool's allocation decision by index.
+    void mirror_take_pages(std::int32_t begin, std::uint32_t count);
+    void mirror_release_page(std::int32_t index);
+
     struct FreePageRun {
         std::int32_t begin  = 0;
         std::uint32_t count = 0;
     };
 
     DeviceKVPagePoolSpec spec_;
+    DeviceKVPagePool* mirror_ = nullptr;
     std::vector<Tensor> planes_;
     std::vector<FreePageRun> free_page_runs_;
     std::vector<std::uint32_t> page_generations_;
@@ -342,6 +355,11 @@ public:
     [[nodiscard]] std::int32_t row_count() const noexcept;
     [[nodiscard]] KVExecutionRowLease acquire(std::int32_t row);
 
+    // Pipeline mirroring: identical layout on the peer rank; every publication is replayed
+    // into the mirror's matrix with the same row and indices, bypassing lease bookkeeping
+    // (rows are owned by the primary only).
+    void set_mirror(KVExecutionTablePool& mirror);
+
     void publish(KVExecutionRowHandle row, std::uint32_t logical_begin,
                  std::span<const DeviceKVPageHandle> pages, cudaStream_t stream = nullptr);
     void publish(KVExecutionRowHandle row, std::uint32_t logical_begin,
@@ -363,6 +381,7 @@ private:
 
     KVExecutionTableSpec spec_;
     const DeviceKVPagePool* pages_ = nullptr;
+    KVExecutionTablePool* mirror_  = nullptr;
     Tensor block_tables_;
     PinnedHostBuffer host_shadow_;
     std::vector<bool> row_in_use_;

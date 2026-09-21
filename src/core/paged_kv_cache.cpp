@@ -342,10 +342,13 @@ void DeviceKVPagePool::materialize(DeviceKVPageReservation& reservation,
         }
     }
 
+    std::vector<std::int32_t> mirrored_pages;
+    if (mirror_ != nullptr) { mirrored_pages.reserve(count); }
     const auto append_page = [&](std::int32_t page) {
         destination.push_back(
             DeviceKVPageLease(*this, page, page_generations_[static_cast<std::size_t>(page)]));
         page_allocated_[static_cast<std::size_t>(page)] = true;
+        if (mirror_ != nullptr) { mirrored_pages.push_back(page); }
     };
     if (selected != free_page_runs_.size()) {
         for (std::uint32_t offset = 0; offset < count; ++offset) {
@@ -375,6 +378,17 @@ void DeviceKVPagePool::materialize(DeviceKVPageReservation& reservation,
     allocated_pages_ += count;
     reserved_pages_ -= count;
     reservation.pages_ -= count;
+    if (mirror_ != nullptr) {
+        std::size_t begin = 0;
+        while (begin < mirrored_pages.size()) {
+            std::size_t end = begin + 1;
+            while (end < mirrored_pages.size() &&
+                   mirrored_pages[end] == mirrored_pages[end - 1] + 1) { ++end; }
+            mirror_->mirror_take_pages(mirrored_pages[begin],
+                                       static_cast<std::uint32_t>(end - begin));
+            begin = end;
+        }
+    }
 }
 
 DeviceKVPageLease DeviceKVPagePool::materialize_one(DeviceKVPageReservation& reservation) {
@@ -391,6 +405,7 @@ DeviceKVPageLease DeviceKVPagePool::materialize_one(DeviceKVPageReservation& res
     ++allocated_pages_;
     --reserved_pages_;
     --reservation.pages_;
+    if (mirror_ != nullptr) { mirror_->mirror_take_pages(page, 1); }
     return DeviceKVPageLease(*this, page, page_generations_[static_cast<std::size_t>(page)]);
 }
 
@@ -470,6 +485,7 @@ void DeviceKVPagePool::release_page(std::int32_t index, std::uint32_t generation
     increment_generation(page_generations_[position]);
     release_free_page(index);
     --allocated_pages_;
+    if (mirror_ != nullptr) { mirror_->mirror_release_page(index); }
 }
 
 void DeviceKVPagePool::consume_free_run(std::size_t run_index, std::int32_t begin,
@@ -526,39 +542,71 @@ void DeviceKVPagePool::release_reservation(std::uint32_t pages) noexcept {
     reserved_pages_ -= pages;
 }
 
-void DeviceKVPagePool::zero_pages(std::span<const DeviceKVPageHandle> pages,
-                                  cudaStream_t stream) const {
-    validate_distinct_pages(pages, "Paged KV zero destination contains duplicate pages");
-    std::size_t begin = 0;
-    while (begin < pages.size()) {
-        std::size_t end = begin + 1;
-        while (end < pages.size() && pages[end].index_ == pages[end - 1].index_ + 1) { ++end; }
-        const std::int32_t first = pages[begin].index_;
-        const std::int32_t count = static_cast<std::int32_t>(end - begin);
-        for (const Tensor& plane : planes_) {
-            auto* base = static_cast<unsigned char*>(plane.data);
-            if (spec_.geometry.device_plane_order == PagedKVPlaneOrder::PageMajor) {
-                CUDA_CHECK(cudaMemsetAsync(base + static_cast<std::int64_t>(first) * plane.nb[3], 0,
-                                           static_cast<std::size_t>(count) * plane.nb[3], stream));
-            } else {
-                CUDA_CHECK(cudaMemset2DAsync(base + static_cast<std::int64_t>(first) * plane.nb[2],
-                                             plane.nb[3], 0,
-                                             static_cast<std::size_t>(count) * plane.nb[2],
-                                             static_cast<std::size_t>(plane.ne[3]), stream));
-            }
+void DeviceKVPagePool::set_mirror(DeviceKVPagePool& mirror) {
+    if (&mirror == this || mirror.mirror_ != nullptr || mirror_ != nullptr) {
+        throw std::invalid_argument("Paged KV mirror wiring is invalid");
+    }
+    if (mirror.spec_.page_group_count != spec_.page_group_count) {
+        throw std::invalid_argument("Paged KV mirror capacity differs from its primary");
+    }
+    mirror_ = &mirror;
+}
+
+void DeviceKVPagePool::mirror_take_pages(std::int32_t begin, std::uint32_t count) {
+    if (count == 0) { return; }
+    if (begin < 0 || static_cast<std::uint64_t>(begin) + count > spec_.page_group_count) {
+        throw std::logic_error("Paged KV mirror allocation is outside the pool");
+    }
+    const std::size_t position = static_cast<std::size_t>(begin);
+    if (page_allocated_[position]) { throw std::logic_error("Paged KV mirror page is busy"); }
+    const auto run = std::lower_bound(
+        free_page_runs_.begin(), free_page_runs_.end(), begin,
+        [](const FreePageRun& candidate, std::int32_t page) { return candidate.begin < page; });
+    if (run == free_page_runs_.begin() || (run - 1)->begin > begin ||
+        static_cast<std::uint64_t>((run - 1)->begin) + (run - 1)->count <
+            static_cast<std::uint64_t>(begin) + count) {
+        throw std::logic_error("Paged KV mirror allocation has no matching free run");
+    }
+    for (std::uint32_t offset = 0; offset < count; ++offset) {
+        page_allocated_[static_cast<std::size_t>(begin) + offset] = true;
+    }
+    consume_free_run(static_cast<std::size_t>(run - 1 - free_page_runs_.begin()), begin, count);
+    allocated_pages_ += count;
+}
+
+void DeviceKVPagePool::mirror_release_page(std::int32_t index) {
+    if (index < 0 || index >= static_cast<std::int32_t>(capacity_pages())) { return; }
+    const std::size_t position = static_cast<std::size_t>(index);
+    if (!page_allocated_[position]) { return; }
+    page_allocated_[position] = false;
+    release_free_page(index);
+    --allocated_pages_;
+}
+
+namespace {
+
+void zero_plane_runs(PagedKVPlaneOrder order, const std::vector<Tensor>& planes,
+                     std::int32_t first, std::int32_t count, cudaStream_t stream) {
+    for (const Tensor& plane : planes) {
+        auto* base = static_cast<unsigned char*>(plane.data);
+        if (order == PagedKVPlaneOrder::PageMajor) {
+            CUDA_CHECK(cudaMemsetAsync(base + static_cast<std::int64_t>(first) * plane.nb[3], 0,
+                                       static_cast<std::size_t>(count) * plane.nb[3], stream));
+        } else {
+            CUDA_CHECK(cudaMemset2DAsync(base + static_cast<std::int64_t>(first) * plane.nb[2],
+                                         plane.nb[3], 0,
+                                         static_cast<std::size_t>(count) * plane.nb[2],
+                                         static_cast<std::size_t>(plane.ne[3]), stream));
         }
-        begin = end;
     }
 }
 
-void DeviceKVPagePool::copy_page(DeviceKVPageHandle source, DeviceKVPageHandle destination,
-                                 cudaStream_t stream) const {
-    const std::int32_t source_index      = physical_index(source);
-    const std::int32_t destination_index = physical_index(destination);
-    if (source_index == destination_index) { return; }
-    for (const Tensor& plane : planes_) {
+void copy_plane_page(PagedKVPlaneOrder order, const std::vector<Tensor>& planes,
+                     std::int32_t source_index, std::int32_t destination_index,
+                     cudaStream_t stream) {
+    for (const Tensor& plane : planes) {
         auto* base = static_cast<unsigned char*>(plane.data);
-        if (spec_.geometry.device_plane_order == PagedKVPlaneOrder::PageMajor) {
+        if (order == PagedKVPlaneOrder::PageMajor) {
             CUDA_CHECK(
                 cudaMemcpyAsync(base + static_cast<std::int64_t>(destination_index) * plane.nb[3],
                                 base + static_cast<std::int64_t>(source_index) * plane.nb[3],
@@ -571,6 +619,39 @@ void DeviceKVPagePool::copy_page(DeviceKVPageHandle source, DeviceKVPageHandle d
                 stream));
         }
     }
+}
+
+} // namespace
+
+void DeviceKVPagePool::zero_pages(std::span<const DeviceKVPageHandle> pages,
+                                  cudaStream_t stream) const {
+    validate_distinct_pages(pages, "Paged KV zero destination contains duplicate pages");
+    std::size_t begin = 0;
+    while (begin < pages.size()) {
+        std::size_t end = begin + 1;
+        while (end < pages.size() && pages[end].index_ == pages[end - 1].index_ + 1) { ++end; }
+        const std::int32_t first = pages[begin].index_;
+        const std::int32_t count = static_cast<std::int32_t>(end - begin);
+        if (mirror_ != nullptr) {
+            zero_plane_runs(mirror_->spec_.geometry.device_plane_order, mirror_->planes_, first,
+                            count, stream);
+        }
+        zero_plane_runs(spec_.geometry.device_plane_order, planes_, first, count, stream);
+        begin = end;
+    }
+}
+
+void DeviceKVPagePool::copy_page(DeviceKVPageHandle source, DeviceKVPageHandle destination,
+                                 cudaStream_t stream) const {
+    const std::int32_t source_index      = physical_index(source);
+    const std::int32_t destination_index = physical_index(destination);
+    if (source_index == destination_index) { return; }
+    if (mirror_ != nullptr) {
+        copy_plane_page(mirror_->spec_.geometry.device_plane_order, mirror_->planes_,
+                        source_index, destination_index, stream);
+    }
+    copy_plane_page(spec_.geometry.device_plane_order, planes_, source_index, destination_index,
+                    stream);
 }
 
 void DeviceKVPagePool::copy_to_host(std::span<const DeviceKVPageHandle> source,
@@ -746,6 +827,13 @@ std::uint32_t KVExecutionTablePool::logical_page_capacity() const noexcept {
 
 std::int32_t KVExecutionTablePool::row_count() const noexcept { return spec_.table_rows; }
 
+void KVExecutionTablePool::set_mirror(KVExecutionTablePool& mirror) {
+    if (&mirror == this || mirror_ != nullptr || mirror.mirror_ != nullptr) {
+        throw std::invalid_argument("Paged KV table mirror wiring is invalid");
+    }
+    mirror_ = &mirror;
+}
+
 KVExecutionRowLease KVExecutionTablePool::acquire(std::int32_t row_index) {
     if (row_index < 0 || row_index >= row_count()) {
         throw std::out_of_range("Paged KV execution row is out of range");
@@ -830,6 +918,13 @@ void KVExecutionTablePool::publish_indices(KVExecutionRowHandle row_handle,
     auto* destination      = static_cast<std::int32_t*>(destination_row.data) + logical_begin;
     CUDA_CHECK(cudaMemcpyAsync(destination, indices.data(), indices.size_bytes(),
                                cudaMemcpyHostToDevice, stream));
+    if (mirror_ != nullptr) {
+        Tensor mirror_row = mirror_->block_tables_.slice(1, row_handle.row_, 1)
+                                .view({static_cast<std::int32_t>(mirror_->logical_page_capacity())});
+        auto* mirror_destination = static_cast<std::int32_t*>(mirror_row.data) + logical_begin;
+        CUDA_CHECK(cudaMemcpyAsync(mirror_destination, indices.data(), indices.size_bytes(),
+                                   cudaMemcpyHostToDevice, stream));
+    }
 }
 
 Tensor KVExecutionTablePool::row(KVExecutionRowHandle handle) const {
