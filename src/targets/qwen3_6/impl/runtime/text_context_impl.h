@@ -4,6 +4,10 @@
 
 #include "core/nvtx.h"
 #include "core/pp_link.h"
+
+#include <cstdio>
+#include <cuda_bf16.h>
+#include <cstdlib>
 #include "targets/qwen3_6/impl/runtime/visual_scatter.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include <ninfer/targets/qwen3_6/vision_control.h>
@@ -1043,6 +1047,17 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
         CUDA_CHECK(cudaMemcpyAsync(x.data, pipeline_.boundary_local,
                                    x.numel() * sizeof(std::uint16_t), cudaMemcpyDeviceToDevice,
                                    ctx_.stream));
+        if (std::getenv("NINFER_PP_DEBUG") != nullptr) {
+            static std::uint16_t host[8] = {};
+            CUDA_CHECK(cudaMemcpyAsync(host, x.data, sizeof(host), cudaMemcpyDeviceToHost,
+                                       ctx_.stream));
+            CUDA_CHECK(cudaStreamSynchronize(ctx_.stream));
+            std::fprintf(stderr, "[PP] rank-in  x0..7 = %g %g %g %g\n",
+                         __bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&host[0])),
+                         __bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&host[1])),
+                         __bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&host[2])),
+                         __bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&host[3])));
+        }
     }
     for (std::uint32_t layer = pp_begin; layer < pp_end; ++layer) {
         if (ModelConfig::is_full(layer)) {
@@ -1090,6 +1105,17 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
         }
     }
     if (pp_end < static_cast<std::uint32_t>(kCfg.n_layers) && pipeline_.pp != nullptr) {
+        if (std::getenv("NINFER_PP_DEBUG") != nullptr) {
+            static std::uint16_t host[8] = {};
+            CUDA_CHECK(cudaMemcpyAsync(host, x.data, sizeof(host), cudaMemcpyDeviceToHost,
+                                       ctx_.stream));
+            CUDA_CHECK(cudaStreamSynchronize(ctx_.stream));
+            std::fprintf(stderr, "[PP] rank-out x0..7 = %g %g %g %g\n",
+                         __bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&host[0])),
+                         __bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&host[1])),
+                         __bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&host[2])),
+                         __bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&host[3])));
+        }
         pipeline_.pp->push(pipeline_.pp_rank, x.data, pipeline_.peer_hidden,
                            x.numel() * sizeof(std::uint16_t), pipeline_.pp_site);
     }
