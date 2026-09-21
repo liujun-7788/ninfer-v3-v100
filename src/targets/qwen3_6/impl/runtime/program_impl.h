@@ -11036,8 +11036,8 @@ qwen3_6::PagedKVCacheView ProgramImplCore::text_kv_view1(const SequenceState& se
     if (!rank1 || !sequence.kv) {
         throw std::logic_error("sequence has no active KV execution mapping");
     }
-    return rank1->decoder->text_kv.execution_view(
-        text_kv_addresses->execution_row(sequence.kv->text));
+    return rank1->decoder->text_kv.execution_view_unchecked(
+        text_kv_addresses->bound_row(sequence.kv->text));
 }
 
 qwen3_6::PagedKVCacheView ProgramImplCore::mtp_kv_view1(const SequenceState& sequence) const {
@@ -11046,8 +11046,8 @@ qwen3_6::PagedKVCacheView ProgramImplCore::mtp_kv_view1(const SequenceState& seq
         !backend_kv_addresses->active(*sequence.kv->backend)) {
         throw std::logic_error("sequence has no active MTP KV execution mapping");
     }
-    return rank1->decoder->mtp_cache()->execution_view(
-        backend_kv_addresses->execution_row(*sequence.kv->backend));
+    return rank1->decoder->mtp_cache()->execution_view_unchecked(
+        backend_kv_addresses->bound_row(*sequence.kv->backend));
 }
 
 schedule::ExecutionCore ProgramImplCore::rank_core(std::size_t rank, const GdnReplayRecords* records,
@@ -11816,11 +11816,15 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                                                                 *staged.vision, remaining,
                                                                 split_frontier, final_candidate);
                 } else {
-                    if (pp_link != nullptr) { pp_link->wait(0, kPpSiteAck); }
+                    if (pp_link != nullptr) {
+                        pp_link->wait(0, kPpSiteAck);
+                        pp_link->rank(0).bind_to_current_thread();
+                    }
                     result = schedule::prefill_text_chunk(
                         schedule_state, std::span<const TokenId>(staged.prompt.token_ids),
                         remaining, split_frontier, final_candidate);
                     if (pp_link != nullptr) {
+                        pp_link->rank(1).bind_to_current_thread();
                         schedule_state1->text_kv_base           = schedule_state.text_kv_base;
                         schedule_state1->state_source_slot      = schedule_state.state_source_slot;
                         schedule_state1->state_destination_slot =
@@ -11828,6 +11832,15 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                         schedule::prefill_text_chunk(
                             *schedule_state1, std::span<const TokenId>(staged.prompt.token_ids),
                             remaining, split_frontier, final_candidate);
+                        if (final_candidate) {
+                            // The last rank owns prefill sampling; publish its token into the
+                            // rank-0 round state the Engine consumes (peer copy on rank0's
+                            // stream, ordered before the host read-back).
+                            CUDA_CHECK(cudaMemcpyAsync(io.token.data, rank1->io->token.data,
+                                                       io.token.bytes(), cudaMemcpyDeviceToDevice,
+                                                       device.stream));
+                        }
+                        pp_link->rank(0).bind_to_current_thread();
                         pp_link->signal(1, kPpSiteAck);
                     }
                 }
@@ -12065,10 +12078,14 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
                                                       state_images->continuation_hidden_store()};
 
         mark_workspace_usage(workspace_plan.ordinary_round);
-        if (pp_link != nullptr) { pp_link->wait(0, kPpSiteAck); }
+        if (pp_link != nullptr) {
+            pp_link->wait(0, kPpSiteAck);
+            pp_link->rank(0).bind_to_current_thread();
+        }
         schedule::ordinary_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                         envelope, executable);
         if (pp_link != nullptr) {
+            pp_link->rank(1).bind_to_current_thread();
             schedule::OrdinaryBatchContext schedule_state1{
                 {rank_core(1, nullptr, kPpSiteVerify)},
                 rank1->decoder->text_kv,
@@ -12078,6 +12095,7 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
                 rank1->state_images->continuation_hidden_store()};
             schedule::ordinary_decode_batch(schedule_state1, static_cast<std::int32_t>(lanes.size()),
                                             envelope, nullptr);
+            pp_link->rank(0).bind_to_current_thread();
             pp_link->signal(1, kPpSiteAck);
         }
         submit_range.reset();
