@@ -62,7 +62,20 @@ Nvfp4WeightGeometry validate_nvfp4_weight(const Weight& weight, const char* oper
         !std::isfinite(weight.weight_scale_divisor) || weight.weight_scale_divisor <= 0.0F ||
         !std::isfinite(weight.input_scale_divisor) || weight.input_scale_divisor <= 0.0F ||
         !aligned_to(weight.qdata, 16) || !aligned_to(weight.scales, 16)) {
-        throw std::invalid_argument(std::string(operation) + ": invalid NVFP4 weight");
+        throw std::invalid_argument(
+            std::string(operation) + ": invalid NVFP4 weight"
+            + " [n=" + std::to_string(weight.n) + " k=" + std::to_string(weight.k)
+            + " layout=" + std::to_string(static_cast<int>(weight.layout))
+            + " qtype=" + std::to_string(static_cast<int>(weight.qtype))
+            + " scale_dtype=" + std::to_string(static_cast<int>(weight.scale_dtype))
+            + " group=" + std::to_string(weight.group)
+            + " ndim=" + std::to_string(weight.ndim)
+            + " payload_bytes=" + std::to_string(weight.payload_bytes)
+            + " required=" + std::to_string(geometry.required_payload_bytes)
+            + " d_w=" + std::to_string(weight.weight_scale_divisor)
+            + " d_x=" + std::to_string(weight.input_scale_divisor)
+            + " qhigh=" + std::string(weight.qhigh != nullptr ? "set" : "null")
+            + " high_bytes=" + std::to_string(weight.high_plane_bytes) + "]");
     }
 
     const auto* payload = static_cast<const std::byte*>(weight.payload);

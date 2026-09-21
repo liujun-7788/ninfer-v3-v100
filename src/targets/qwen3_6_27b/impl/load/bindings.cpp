@@ -186,8 +186,12 @@ DensePostMixerPayload load_mlp(const MlpPlan& plan,
     out.gate_up = materialized_weight(materialized, plan.gate_up, 34816, 5120);
     out.down    = materialized_weight(materialized, plan.down, 5120, 17408);
 #ifdef NINFER_VOLTA_BUILD
+    // The mixed profile allows gate_up and down formats to differ; prepack
+    // each NVFP4 weight on its own qtype instead of keying off gate_up.
     if (out.gate_up.qtype == QType::NVFP4) {
         ::ninfer::ops::detail::nvfp4_prepack_qpn_sm70(out.gate_up);
+    }
+    if (out.down.qtype == QType::NVFP4) {
         ::ninfer::ops::detail::nvfp4_prepack_qpn_sm70(out.down);
     }
 #endif
