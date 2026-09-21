@@ -111,7 +111,8 @@ DeviceContext& DeviceContext::operator=(DeviceContext&& other) noexcept {
 void DeviceContext::bind_to_current_thread() const {
     const cudaError_t err = cudaSetDevice(device);
     if (err != cudaSuccess) {
-        throw std::runtime_error(cuda_error_message("cudaSetDevice failed", err));
+        throw std::runtime_error(cuda_error_message(
+            ("cudaSetDevice(" + std::to_string(device) + ") failed").c_str(), err));
     }
 }
 

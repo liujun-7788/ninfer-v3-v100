@@ -61,8 +61,17 @@ PpLink::PpLink(std::vector<DeviceContext*> ranks) : ranks_(std::move(ranks)) {
 }
 
 PpLink::PpLink(DeviceContext& rank0, int peer_device)
-    : peer_owner_(std::make_unique<DeviceContext>(peer_device)) {
-    ranks_ = {&rank0, peer_owner_.get()};
+    : PpLink(rank0, std::vector<int>{peer_device}) {}
+
+PpLink::PpLink(DeviceContext& rank0, std::vector<int> peer_devices) {
+    ranks_.push_back(&rank0);
+    for (int device : peer_devices) {
+        owned_peers_.push_back(std::make_unique<DeviceContext>(device));
+        ranks_.push_back(owned_peers_.back().get());
+    }
+    if (ranks_.size() < 2) {
+        throw std::invalid_argument("PpLink requires at least two ranks");
+    }
     enable_peer_access();
     init_mailbox();
 }

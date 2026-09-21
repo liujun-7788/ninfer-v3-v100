@@ -1042,21 +1042,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     }
     CUDA_CHECK(cudaMemsetAsync(token_counts.data, 0, token_counts.bytes(), device.stream));
     CUDA_CHECK(cudaMemsetAsync(sampling_config.data, 0, sampling_config.bytes(), device.stream));
-    device.synchronize();
-    if (use_cuda_graph) {
-        StartupPhaseScope graph_phase(startup_observer, StartupPhase::CudaGraphPrepare);
-        prepare_graphs();
-        graph_phase.complete();
-    }
-    work.reset();
-    work.reset_peak();
-    workspace_logical_peak_bytes = 0;
-
     if (seed.pp != nullptr) {
-        if (use_cuda_graph) {
-            throw std::invalid_argument(
-                "Qwen3.6 pipeline mode requires CUDA Graphs to be disabled in this version");
-        }
         if (plan.features.vision) {
             throw std::invalid_argument("Qwen3.6 pipeline mode does not support Vision yet");
         }
@@ -1151,6 +1137,16 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
             pp_link->arm_zero_wait(s, kPpSiteAckBase + s);
         }
     }
+
+    device.synchronize();
+    if (use_cuda_graph) {
+        StartupPhaseScope graph_phase(startup_observer, StartupPhase::CudaGraphPrepare);
+        prepare_graphs();
+        graph_phase.complete();
+    }
+    work.reset();
+    work.reset_peak();
+    workspace_logical_peak_bytes = 0;
 
     work.reset();
     work.reset_peak();
@@ -11172,7 +11168,31 @@ void ProgramImplCore::ordered_reset(SequenceState& sequence) {
 
 void ProgramImplCore::prepare_graphs() {
     if (!use_cuda_graph) { return; }
+    const std::size_t pr_count = pp_link != nullptr ? pp_link->rank_count() : 1;
+    for (std::size_t pr = 0; pr < pr_count; ++pr) { prepare_graphs_stage(pr); }
+}
+
+void ProgramImplCore::prepare_graphs_stage(std::size_t pr) {
     nvtx::ScopedRange prepare_range(nvtx::Name::CudaGraphPrepare, nvtx::Category::Graph);
+    DeviceContext& device = pr == 0 ? this->device : pp_link->rank(pr);
+    device.bind_to_current_thread();
+    qwen3_6::RoundState& io = pr == 0 ? this->io : *pp_stages[pr - 1].io;
+    WorkspaceArena& work = pr == 0 ? this->work : *pp_stages[pr - 1].work;
+    const LoadedModelData& model = pr == 0 ? this->model : *pp_stages[pr - 1].model;
+    std::unique_ptr<qwen3_6::StateImageDevicePool>& state_images =
+        pr == 0 ? this->state_images : pp_stages[pr - 1].state_images;
+    std::unique_ptr<qwen3_6::DecoderState>& decoder =
+        pr == 0 ? this->decoder : pp_stages[pr - 1].decoder;
+    std::optional<GdnReplayRecords>& replay_records =
+        pr == 0 ? this->replay_records : pp_stages[pr - 1].replay_records;
+    std::optional<GdnReplayRecords>& mtp_lookup_replay_records =
+        pr == 0 ? this->mtp_lookup_replay_records : pp_stages[pr - 1].mtp_lookup_replay_records;
+    Tensor& prefill_hidden = pr == 0 ? this->prefill_hidden : pp_stages[pr - 1].prefill_hidden;
+    DecodeGraphFamily& ordinary_graphs =
+        pr == 0 ? this->ordinary_graphs : pp_stages[pr - 1].ordinary_graphs;
+    DecodeGraphFamily& mtp_graphs = pr == 0 ? this->mtp_graphs : pp_stages[pr - 1].mtp_graphs;
+    DecodeGraphFamily& mtp_lookup_graphs =
+        pr == 0 ? this->mtp_lookup_graphs : pp_stages[pr - 1].mtp_lookup_graphs;
 
     std::array<StateImageHandle, kMaximumConcurrency> capture_states{};
     for (std::uint32_t row = 0; row < max_concurrency; ++row) {
@@ -11213,11 +11233,13 @@ void ProgramImplCore::prepare_graphs() {
                                     tables.logical_page_capacity(), device.stream);
         }
     };
-    reserve_capture_rows(decoder->text_kv, *text_kv_addresses, text_capture_allocations,
+    // Row reservation and publication go through the PRIMARY cache only — the mirror
+    // wiring replays them into every stage's tables with identical row indexes.
+    reserve_capture_rows(this->decoder->text_kv, *text_kv_addresses, text_capture_allocations,
                          "target KV cache");
     if (speculative_backend == SpeculativeBackend::Mtp) {
-        reserve_capture_rows(*decoder->mtp_cache(), *backend_kv_addresses, mtp_capture_allocations,
-                             "MTP KV cache");
+        reserve_capture_rows(*this->decoder->mtp_cache(), *backend_kv_addresses,
+                             mtp_capture_allocations, "MTP KV cache");
     } else if (dflash && dflash->full) {
         reserve_capture_rows(*dflash->full, *backend_kv_addresses, dflash_capture_allocations,
                              "DFlash Full KV cache");
@@ -11258,9 +11280,9 @@ void ProgramImplCore::prepare_graphs() {
         }
         work.reset();
         clear_stable_controls();
-        zero_capture_pages(decoder->text_kv, *text_kv_addresses, text_capture_allocations,
+        zero_capture_pages(this->decoder->text_kv, *text_kv_addresses, text_capture_allocations,
                            batch_size);
-        if (decoder->mtp_cache() != nullptr) {
+        if (this->decoder->mtp_cache() != nullptr) {
             zero_capture_pages(*decoder->mtp_cache(), *backend_kv_addresses,
                                mtp_capture_allocations, batch_size);
         }
@@ -11357,15 +11379,7 @@ void ProgramImplCore::prepare_graphs() {
         }
     };
     const auto execution_core = [&](const GdnReplayRecords* records) {
-        return schedule::ExecutionCore{device,
-                                       model,
-                                       work,
-                                       state_images->linear(),
-                                       records,
-                                       io,
-                                       prefill_hidden,
-                                       prefill_chunk,
-                                       proposal_head};
+        return rank_core(pr, records, kPpSiteVerifyBase);
     };
 
     if (speculative_backend == SpeculativeBackend::None) {
@@ -12094,6 +12108,7 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         submit_range.emplace(nvtx::Name::DecodeOrdinarySubmit, nvtx::Category::Decode,
                              static_cast<std::uint64_t>(lanes.size()));
         DecodeGraphExecutable* executable = nullptr;
+        std::vector<DecodeGraphExecutable*> stage_executables;
         ops::CausalAttentionExecutionEnvelope envelope{maximum_frontier + 1, maximum_frontier + 1};
         if (use_cuda_graph) {
             DecodeGraphProfile& profile =
@@ -12101,6 +12116,16 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
                                      maximum_frontier, "ordinary batch");
             executable = &install_graph_profile(ordinary_graphs, profile, "ordinary batch");
             envelope   = {profile.min_execution_frontier + 1, profile.max_execution_frontier + 1};
+            if (pp_link != nullptr) {
+                stage_executables.assign(pp_link->rank_count() - 1, nullptr);
+                for (std::size_t s = 1; s < pp_link->rank_count(); ++s) {
+                    DecodeGraphProfile& stage_profile = select_graph_profile(
+                        pp_stages[s - 1].ordinary_graphs, static_cast<std::uint32_t>(lanes.size()),
+                        maximum_frontier, "ordinary batch");
+                    stage_executables[s - 1] = &install_graph_profile(
+                        pp_stages[s - 1].ordinary_graphs, stage_profile, "ordinary batch");
+                }
+            }
         }
 
         for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -12152,9 +12177,9 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
                                                 static_cast<std::int32_t>(lanes.size()),
                                                 envelope, executable);
             } else {
-                schedule::ordinary_decode_batch(stage_ctxs[s - 1],
-                                                static_cast<std::int32_t>(lanes.size()),
-                                                envelope, nullptr);
+                schedule::ordinary_decode_batch(
+                    stage_ctxs[s - 1], static_cast<std::int32_t>(lanes.size()), envelope,
+                    stage_executables.empty() ? nullptr : stage_executables[s - 1]);
             }
             if (pp_link != nullptr && s > 0) {
                 pp_link->signal_done(s, kPpSiteAckBase + s - 1);

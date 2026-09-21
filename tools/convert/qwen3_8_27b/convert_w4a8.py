@@ -144,12 +144,96 @@ def _encode_fp8_weight(
     return encode_fp8_row_scaled(codes, scales, spec.shape)
 
 
+_TORCH_E4M3_TABLE: torch.Tensor | None = None
+
+
+def _torch_e4m3_table(device: str | torch.device) -> torch.Tensor:
+    global _TORCH_E4M3_TABLE
+    if _TORCH_E4M3_TABLE is None or str(_TORCH_E4M3_TABLE.device) != str(device):
+        import numpy as np
+
+        _TORCH_E4M3_TABLE = torch.tensor(
+            np.asarray(fp8_embedding._POSITIVE_E4M3FN_VALUES, dtype=np.float32),
+            device=device,
+        )
+    return _TORCH_E4M3_TABLE
+
+
+def _quantize_rows_torch(weight_bf16: torch.Tensor, device: str | torch.device):
+    """Bit-exact torch port of fp8_embedding._quantize_host_rows.
+
+    Same operations, dtypes, and RNE semantics; runs on the GPU. Verified
+    byte-identical against the numpy reference before use.
+    """
+    table = _torch_e4m3_table(device)
+    e4max = float(fp8_embedding._E4M3FN_MAX)
+    min_word = int(fp8_embedding._BF16_MIN_SUBNORMAL_WORD)
+    host32 = weight_bf16.to(device=device, dtype=torch.float32)
+    amax = host32.abs().amax(dim=1)
+    zero_rows = amax == 0
+    raw_scale = (amax.to(torch.float64) / e4max).to(torch.float32)
+    sw32 = raw_scale.to(torch.bfloat16).view(torch.uint16).to(torch.int32)
+    underflow = (sw32 == 0) & ~zero_rows
+    sw32 = torch.where(underflow, min_word, sw32)
+    scale_words = sw32.to(torch.uint16)
+    scale32 = (sw32.to(torch.int64) * 65536).to(torch.uint32).view(torch.float32)
+    invalid = (~zero_rows) & (~torch.isfinite(scale32) | (scale32 <= 0))
+    if bool(invalid.any()):
+        raise ValueError("embedding row scale is not finite and positive")
+    recip = torch.zeros_like(scale32)
+    nz = ~zero_rows
+    recip[nz] = (1.0 / scale32[nz].to(torch.float64)).to(torch.float32)
+    normalized = (host32.to(torch.float64) * recip.to(torch.float64)[:, None]).to(
+        torch.float32
+    )
+    if bool((~torch.isfinite(normalized[nz])).any()):
+        raise ValueError("embedding normalization produced a non-finite value")
+    bounded = torch.clamp(normalized, -e4max, e4max)
+    magnitude = bounded.abs()
+    upper = torch.searchsorted(table, magnitude).to(torch.int16)
+    upper = torch.minimum(upper, torch.tensor(0x7E, dtype=torch.int16, device=device))
+    lower = torch.maximum(upper - 1, torch.tensor(0, dtype=torch.int16, device=device))
+    lo_d = magnitude - table[lower.long()]
+    hi_d = table[upper.long()] - magnitude
+    choose_upper = (hi_d < lo_d) | ((hi_d == lo_d) & ((upper & 1) == 0))
+    words = torch.where(choose_upper, upper, lower).to(torch.uint8)
+    sign = torch.where(
+        torch.signbit(bounded),
+        torch.tensor(0x80, dtype=torch.uint8, device=device),
+        torch.tensor(0, dtype=torch.uint8, device=device),
+    )
+    words = words | sign
+    words[zero_rows] = 0
+    return words, scale_words
+
+
 def _encode_fp8_from_bf16(
     reader: ShardReader,
     source_name: str,
     spec: inventory.TensorSpec,
+    device: str | torch.device,
 ) -> Iterable[bytes]:
-    return fp8_embedding.iter_reader_payload(reader, source_name, spec.shape)
+    tensor = reader.get(source_name)
+    if tuple(tensor.shape) != tuple(spec.shape):
+        raise ValueError(
+            f"{source_name}: materialized shape {tuple(tensor.shape)} != {spec.shape}"
+        )
+    rows = spec.shape[0]
+    columns = spec.shape[1]
+    if device != "cpu" and torch.cuda.is_available():
+        step = 32768
+        for begin in range(0, rows, step):
+            end = min(begin + step, rows)
+            chunk = tensor[begin:end].to(device)
+            codes, scale_words = _quantize_rows_torch(chunk, device)
+            scales = scale_words.view(torch.bfloat16)
+            yield fp8_embedding.encode_fp8_row_scaled(
+                codes, scales, (end - begin, columns)
+            )
+        return
+    for begin in range(0, rows, 8192):
+        end = min(begin + 8192, rows)
+        yield fp8_embedding.encode_bf16_rows(tensor[begin:end])
 
 
 def _materialize_direct(
@@ -291,14 +375,15 @@ def convert(
             words_cache: dict = {}
             for spec in inventory.BASE_TENSOR_SPECS:
                 index += 1
+                object_started = time.perf_counter()
                 payload: bytes | Iterable[bytes]
                 if spec.name == "text/token_embedding":
                     payload = _encode_fp8_from_bf16(
-                        reader, recipe.EMBEDDING_SOURCE, spec
+                        reader, recipe.EMBEDDING_SOURCE, spec, resolved_device
                     )
                 elif spec.name == "text/output_head":
                     payload = _encode_fp8_from_bf16(
-                        reader, recipe.OUTPUT_HEAD_SOURCE, spec
+                        reader, recipe.OUTPUT_HEAD_SOURCE, spec, resolved_device
                     )
                 elif spec.name in recipe.FP8_WEIGHTS_BY_NAME:
                     payload = _encode_fp8_weight(spec, reader)
@@ -323,8 +408,11 @@ def convert(
                     del tensor
                 writer.write(spec.name, payload)
                 del payload
-                if index % 64 == 0:
-                    print(f"[{index}/{total}] objects written", flush=True)
+                print(
+                    f"[{index}/{total}] {spec.name} "
+                    f"{time.perf_counter() - object_started:.2f}s",
+                    flush=True,
+                )
 
         with ShardReader.from_file(
             preflight.dflash2_model_dir / "model.safetensors"

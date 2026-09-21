@@ -1231,6 +1231,7 @@ private:
     void release_sequence_state_strict(SequenceState& sequence) noexcept;
     void release_sequence_state(SequenceState& sequence) noexcept;
     void prepare_graphs();
+    void prepare_graphs_stage(std::size_t pr);
     void install_sampling(SequenceState& sequence, RequestControl& request,
                           const ops::SamplingConfig& config);
     void set_device_i32(Tensor& tensor, std::int32_t value);
