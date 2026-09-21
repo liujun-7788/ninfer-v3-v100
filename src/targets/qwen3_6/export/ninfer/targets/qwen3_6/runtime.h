@@ -18,6 +18,12 @@ namespace ninfer {
 struct DeviceContext;
 }
 
+namespace ninfer {
+
+class PpLink;
+
+} // namespace ninfer
+
 namespace ninfer::targets::qwen3_6 {
 
 namespace detail {
@@ -826,6 +832,15 @@ struct ReleaseResult {
     runtime::ConsumeStatus status = runtime::ConsumeStatus::InvariantMismatch;
 };
 
+// Pipeline handoff for two-rank layer-parallel execution. When pp is set, ProgramImplCore
+// builds a mirror physical store set on the peer device and executes the model layer range
+// split across ranks; rank1_model is the second full model view loaded on the peer device.
+template <class Variant>
+struct ProgramPipelineSeed {
+    PpLink* pp                              = nullptr;
+    const typename Variant::ModelView* rank1_model = nullptr;
+};
+
 template <class Variant>
 class Program {
 public:
@@ -943,9 +958,9 @@ private:
     std::unique_ptr<detail::ProgramImpl<Variant>> impl_;
 
     template <class V>
-    friend std::unique_ptr<Program<V>> create_program(const typename V::ModelView&,
-                                                      typename V::WeightsProfile, SequencePlan<V>&&,
-                                                      DeviceContext&, const StartupObserver&);
+    friend std::unique_ptr<Program<V>> create_program(
+        const typename V::ModelView&, typename V::WeightsProfile, SequencePlan<V>&&,
+        DeviceContext&, const StartupObserver&, const ProgramPipelineSeed<V>&);
 };
 
 namespace detail {
@@ -1110,6 +1125,7 @@ template <class Variant>
 [[nodiscard]] std::unique_ptr<Program<Variant>>
 create_program(const typename Variant::ModelView& model,
                typename Variant::WeightsProfile weights_profile, SequencePlan<Variant>&& plan,
-               DeviceContext& device, const StartupObserver& startup_observer);
+               DeviceContext& device, const StartupObserver& startup_observer,
+               const ProgramPipelineSeed<Variant>& seed = {});
 
 } // namespace ninfer::targets::qwen3_6

@@ -765,7 +765,8 @@ void instantiate_graph_family(DecodeGraphFamily& family, const char* label, Devi
 } // namespace
 
 ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const SequencePlanImpl& plan,
-                                 DeviceContext& device_in, const StartupObserver& startup_observer)
+                                 DeviceContext& device_in, const StartupObserver& startup_observer,
+                                 const qwen3_6::ProgramPipelineSeed<Variant>& seed)
     : model(model_in), device(device_in), capacity(plan.capacity), kv_capacity(plan.kv_capacity),
       max_concurrency(plan.max_concurrency), context_cache(plan.context_cache),
       continuation_capacity(normalized_private_capacity(plan.context_cache)),
@@ -1047,6 +1048,68 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         prepare_graphs();
         graph_phase.complete();
     }
+    work.reset();
+    work.reset_peak();
+    workspace_logical_peak_bytes = 0;
+
+    if (seed.pp != nullptr) {
+        if (use_cuda_graph) {
+            throw std::invalid_argument(
+                "Qwen3.6 pipeline mode requires CUDA Graphs to be disabled in this version");
+        }
+        if (plan.features.vision) {
+            throw std::invalid_argument("Qwen3.6 pipeline mode does not support Vision yet");
+        }
+        pp_link = seed.pp;
+        rank1.emplace();
+        DeviceContext& peer = seed.pp->rank(1);
+        peer.bind_to_current_thread();
+        rank1->persistent = std::make_unique<DeviceArena>(plan.persistent.bytes);
+        const DeviceSpan backing1 = rank1->persistent->alloc_bytes(plan.persistent.bytes, 256);
+        rank1->workspace_storage = std::make_unique<DeviceArena>(plan.workspace.capacity);
+        rank1->work = std::make_unique<WorkspaceArena>(
+            DeviceSpan{rank1->workspace_storage->base(), plan.workspace.general_capacity});
+        rank1->decoder = std::make_unique<qwen3_6::DecoderState>(backing1, plan.persistent.decoder);
+        decoder->text_kv.page_pool().set_mirror(rank1->decoder->text_kv.page_pool());
+        decoder->text_kv.execution_tables().set_mirror(
+            rank1->decoder->text_kv.execution_tables());
+        if (qwen3_6::PagedKVCache* backend1 = rank1->decoder->mtp_cache()) {
+            if (qwen3_6::PagedKVCache* backend0 = backend_kv_cache()) {
+                backend0->page_pool().set_mirror(backend1->page_pool());
+                backend0->execution_tables().set_mirror(backend1->execution_tables());
+            }
+        }
+        rank1->state_images =
+            std::make_unique<qwen3_6::StateImageDevicePool>(backing1, plan.persistent.state_images);
+        if (plan.persistent.replay_records) {
+            rank1->replay_records.emplace(backing1, *plan.persistent.replay_records);
+            rank1->replay_fold.emplace(*rank1->replay_records,
+                                       rank1->state_images->linear().all_layers_view());
+        }
+        if (plan.persistent.mtp_lookup_replay_records) {
+            rank1->mtp_lookup_replay_records.emplace(backing1,
+                                                     *plan.persistent.mtp_lookup_replay_records);
+            rank1->mtp_lookup_replay_fold.emplace(
+                *rank1->mtp_lookup_replay_records, rank1->state_images->linear().all_layers_view());
+        }
+        rank1->io.emplace(backing1, plan.persistent.round);
+        rank1->prefill_hidden = plan.persistent.prefill_hidden.bind(backing1);
+        const std::size_t boundary_bytes =
+            static_cast<std::size_t>(prefill_chunk) * static_cast<std::size_t>(TextConfig::hidden) * 2U;
+        void* boundary_ptr = nullptr;
+        CUDA_CHECK(cudaMalloc(&boundary_ptr, boundary_bytes));
+        rank1->boundary = Tensor(boundary_ptr, DType::BF16,
+                                 {static_cast<std::int32_t>(TextConfig::hidden),
+                                  static_cast<std::int32_t>(prefill_chunk)});
+        rank1->model = seed.rank1_model;
+        if (seed.rank1_model == nullptr) {
+            throw std::invalid_argument("Qwen3.6 pipeline seed requires a rank-1 model view");
+        }
+        pp_split = static_cast<std::uint32_t>(TextConfig::layers) / 2U;
+        peer.synchronize();
+        device_in.synchronize();
+    }
+
     work.reset();
     work.reset_peak();
     workspace_logical_peak_bytes = 0;

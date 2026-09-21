@@ -33,6 +33,12 @@
 #include <variant>
 #include <vector>
 
+namespace ninfer {
+
+class PpLink;
+
+} // namespace ninfer
+
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
 
 using PreparedPromptData    = qwen3_6::PreparedPromptData;
@@ -518,7 +524,8 @@ public:
     };
 
     ProgramImplCore(const LoadedModelData& model, const SequencePlanImpl& plan,
-                    DeviceContext& device, const StartupObserver& startup_observer);
+                    DeviceContext& device, const StartupObserver& startup_observer,
+                    const qwen3_6::ProgramPipelineSeed<Variant>& seed = {});
     ~ProgramImplCore() noexcept;
 
     [[nodiscard]] RequestBasePlan plan_request(const PreparedPromptData& prompt,
@@ -677,6 +684,28 @@ public:
     DecodeGraphFamily mtp_graphs;
     DecodeGraphFamily mtp_lookup_graphs;
     DecodeGraphFamily dflash_graphs;
+
+    // Pipeline rank-1 mirror physical set (populated only when a pipeline seed is given).
+    // Same layout plans over a rank-1 backing; KV pools are mirror-wired to rank0's so
+    // page ids and block tables stay identical across ranks.
+    struct RankState {
+        std::unique_ptr<DeviceArena> persistent;
+        std::unique_ptr<DeviceArena> workspace_storage;
+        std::unique_ptr<WorkspaceArena> work;
+        std::unique_ptr<qwen3_6::DecoderState> decoder;
+        std::unique_ptr<qwen3_6::StateImageDevicePool> state_images;
+        std::optional<GdnReplayRecords> replay_records;
+        std::optional<ops::GdnReplayFoldPlan> replay_fold;
+        std::optional<GdnReplayRecords> mtp_lookup_replay_records;
+        std::optional<ops::GdnReplayFoldPlan> mtp_lookup_replay_fold;
+        std::optional<qwen3_6::RoundState> io;
+        Tensor prefill_hidden;
+        Tensor boundary;
+        const LoadedModelData* model = nullptr;
+    };
+    std::optional<RankState> rank1;
+    PpLink* pp_link          = nullptr;
+    std::uint32_t pp_split   = 0;
 
     PinnedHostBuffer round_host;
     std::optional<PinnedHostBuffer> score_logprobs_host;

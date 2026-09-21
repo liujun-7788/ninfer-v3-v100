@@ -585,14 +585,15 @@ template <>
 std::unique_ptr<Program<Variant>>
 create_program<Variant>(const Variant::ModelView& model, Variant::WeightsProfile weights_profile,
                         SequencePlan<Variant>&& plan, DeviceContext& device,
-                        const StartupObserver& startup_observer) {
+                        const StartupObserver& startup_observer,
+                        const ProgramPipelineSeed<Variant>& seed) {
     if (plan.impl_ == nullptr) { throw std::invalid_argument("sequence plan is empty"); }
     if (plan.impl_->weights_profile != weights_profile) {
         throw std::invalid_argument(
             "loaded model weights profile does not match the sequence plan");
     }
     auto impl = std::make_unique<detail::ProgramImpl<Variant>>(model, *plan.impl_, device,
-                                                               startup_observer);
+                                                               startup_observer, seed);
     plan.impl_.reset();
     return std::unique_ptr<Program<Variant>>(new Program<Variant>(std::move(impl)));
 }
