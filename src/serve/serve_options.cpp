@@ -261,14 +261,19 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.device = parse_nonnegative_int(require_value("--device"), "device");
         } else if (arg == "--pp-devices") {
             const std::string value = require_value("--pp-devices");
-            const auto comma        = value.find(',');
-            if (comma == std::string::npos) {
-                throw std::invalid_argument("--pp-devices expects '<primary>,<peer>'");
+            std::vector<int> devices;
+            std::size_t begin = 0;
+            while (true) {
+                const auto comma = value.find(',', begin);
+                const std::string part = comma == std::string::npos
+                                             ? value.substr(begin)
+                                             : value.substr(begin, comma - begin);
+                devices.push_back(parse_nonnegative_int(part.c_str(), "pp-devices entry"));
+                if (comma == std::string::npos) { break; }
+                begin = comma + 1;
             }
-            options.device = parse_nonnegative_int(value.substr(0, comma).c_str(),
-                                                   "pp-devices primary");
-            options.pp_peer_device =
-                parse_nonnegative_int(value.substr(comma + 1).c_str(), "pp-devices peer");
+            options.device     = devices.front();
+            options.pp_devices = std::move(devices);
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
         } else if (arg == "--spec") {

@@ -200,7 +200,8 @@ public:
         std::uint32_t gdn_offset      = 0;
         std::uint32_t attn_offset     = 0;
         ninfer::PpLink* pp            = nullptr;
-        std::size_t pp_site           = 0;
+        std::size_t pp_site_in        = 0;
+        std::size_t pp_site_out       = 0;
         std::size_t pp_rank           = 0;
         void* peer_hidden             = nullptr;
         std::size_t peer_hidden_bytes = 0;

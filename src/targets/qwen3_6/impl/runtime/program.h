@@ -702,11 +702,17 @@ public:
         Tensor prefill_hidden;
         Tensor boundary;
         const LoadedModelData* model = nullptr;
+        DecodeGraphFamily ordinary_graphs;
+        DecodeGraphFamily mtp_graphs;
+        DecodeGraphFamily mtp_lookup_graphs;
     };
-    std::optional<RankState> rank1;
+    std::vector<RankState> pp_stages;   // stages 1..N-1 (index stage-1)
     PpLink* pp_link              = nullptr;
-    std::uint32_t pp_split       = 0;
-    std::uint32_t pp_attn_count  = 0;
+    std::uint32_t pp_stage_count = 0;
+    std::vector<std::uint32_t> pp_begins;
+    std::vector<std::uint32_t> pp_ends;
+    std::vector<std::uint32_t> pp_gdn_offsets;
+    std::vector<std::uint32_t> pp_attn_offsets;
 
     PinnedHostBuffer round_host;
     std::optional<PinnedHostBuffer> score_logprobs_host;
@@ -1277,14 +1283,16 @@ private:
     [[nodiscard]] const qwen3_6::PagedKVCache* backend_kv_cache() const noexcept;
     [[nodiscard]] std::uint32_t backend_kv_valid(const SequenceState& sequence) const noexcept;
     [[nodiscard]] qwen3_6::PagedKVCacheView text_kv_view(const SequenceState& sequence) const;
-    [[nodiscard]] qwen3_6::PagedKVCacheView text_kv_view1(const SequenceState& sequence) const;
-    [[nodiscard]] qwen3_6::PagedKVCacheView mtp_kv_view1(const SequenceState& sequence) const;
+    [[nodiscard]] qwen3_6::PagedKVCacheView text_kv_view_stage(std::size_t stage,
+                                                               const SequenceState& sequence) const;
+    [[nodiscard]] qwen3_6::PagedKVCacheView mtp_kv_view_stage(std::size_t stage,
+                                                              const SequenceState& sequence) const;
     [[nodiscard]] schedule::ExecutionCore rank_core(std::size_t rank, const GdnReplayRecords* records,
-                                                    std::size_t hidden_site);
-    static constexpr std::size_t kPpSitePrefill = 0;
-    static constexpr std::size_t kPpSiteVerify  = 1;
-    static constexpr std::size_t kPpSiteMtp     = 2;
-    static constexpr std::size_t kPpSiteAck     = 3;
+                                                    std::size_t hidden_site_base);
+    static constexpr std::size_t kPpSitePrefillBase = 0;
+    static constexpr std::size_t kPpSiteVerifyBase  = 32;
+    static constexpr std::size_t kPpSiteMtpBase     = 64;
+    static constexpr std::size_t kPpSiteAckBase     = 96;
     [[nodiscard]] qwen3_6::PagedKVCacheView mtp_kv_view(const SequenceState& sequence) const;
 };
 

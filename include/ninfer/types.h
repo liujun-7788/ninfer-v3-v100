@@ -166,10 +166,11 @@ struct EngineOptions {
     std::uint32_t media_preprocess_threads = 0;
     bool enable_vision                     = false;
     bool use_cuda_graph                    = true;
-    // Pipeline-parallel peer device. When set, the engine loads the full model on both
-    // devices, splits the layer range across them, and exchanges boundary hidden states
-    // through a PpLink. The peer must have P2P access to the primary device.
-    std::optional<int> pp_peer_device;
+    // Pipeline-parallel device chain. When non-empty, the engine loads the full model on
+    // every device, splits the layer range across them, and exchanges boundary hidden
+    // states through a PpLink. Every peer must have P2P access along the chain; the first
+    // entry must equal `device`. Supported sizes today: 2 and 4.
+    std::vector<int> pp_devices;
     ContextCacheOptions context_cache;
     ContextCostOptions context_cost;
     StartupObserver startup_observer;

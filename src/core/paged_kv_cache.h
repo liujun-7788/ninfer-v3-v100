@@ -200,8 +200,8 @@ public:
     // pool replays on the mirror with the same page indices, so both pools evolve identical
     // free lists and a block-table row built here is valid on both. Ownership (leases,
     // reservations) stays with the primary; the mirror is never handed out.
-    void set_mirror(DeviceKVPagePool& mirror);
-    [[nodiscard]] bool has_mirror() const noexcept { return mirror_ != nullptr; }
+    void add_mirror(DeviceKVPagePool& mirror);
+    [[nodiscard]] bool has_mirror() const noexcept { return !mirrors_.empty(); }
 
     [[nodiscard]] const KVPageGeometry& geometry() const noexcept { return spec_.geometry; }
 
@@ -263,13 +263,16 @@ private:
     void mirror_take_pages(std::int32_t begin, std::uint32_t count);
     void mirror_release_page(std::int32_t index);
 
+    [[nodiscard]] std::size_t mirror_count() const noexcept { return mirrors_.size(); }
+    [[nodiscard]] DeviceKVPagePool& mirror(std::size_t index) { return *mirrors_.at(index); }
+
     struct FreePageRun {
         std::int32_t begin  = 0;
         std::uint32_t count = 0;
     };
 
     DeviceKVPagePoolSpec spec_;
-    DeviceKVPagePool* mirror_ = nullptr;
+    std::vector<DeviceKVPagePool*> mirrors_;
     std::vector<Tensor> planes_;
     std::vector<FreePageRun> free_page_runs_;
     std::vector<std::uint32_t> page_generations_;
@@ -358,7 +361,7 @@ public:
     // Pipeline mirroring: identical layout on the peer rank; every publication is replayed
     // into the mirror's matrix with the same row and indices, bypassing lease bookkeeping
     // (rows are owned by the primary only).
-    void set_mirror(KVExecutionTablePool& mirror);
+    void add_mirror(KVExecutionTablePool& mirror);
 
     void publish(KVExecutionRowHandle row, std::uint32_t logical_begin,
                  std::span<const DeviceKVPageHandle> pages, cudaStream_t stream = nullptr);
@@ -383,8 +386,8 @@ private:
                          std::span<const std::int32_t> indices, cudaStream_t stream);
 
     KVExecutionTableSpec spec_;
-    const DeviceKVPagePool* pages_ = nullptr;
-    KVExecutionTablePool* mirror_  = nullptr;
+    const DeviceKVPagePool* pages_      = nullptr;
+    std::vector<KVExecutionTablePool*> mirrors_;
     Tensor block_tables_;
     PinnedHostBuffer host_shadow_;
     std::vector<bool> row_in_use_;
