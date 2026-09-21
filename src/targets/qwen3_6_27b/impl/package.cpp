@@ -147,8 +147,9 @@ std::unique_ptr<Package::Program> Package::create_program(const LoadedModel& mod
     if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
     qwen3_6::ProgramPipelineSeed<detail::Variant> seed;
     seed.pp = pipeline.pp;
-    if (pipeline.rank1_model != nullptr) {
-        seed.rank1_model = &pipeline.rank1_model->impl_->data.runtime;
+    seed.stage_models.reserve(pipeline.stage_models.size());
+    for (const LoadedModel* model : pipeline.stage_models) {
+        seed.stage_models.push_back(&model->impl_->data.runtime);
     }
     return qwen3_6::create_program<detail::Variant>(model.impl_->data.runtime,
                                                     model.impl_->weights_profile, std::move(plan),

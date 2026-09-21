@@ -63,9 +63,19 @@ void validate_options(const EngineOptions& options) {
     if (options.media_preprocess_threads > 64) {
         throw std::invalid_argument("Engine media_preprocess_threads must be in [0,64]");
     }
-    if (options.pp_peer_device.has_value()) {
-        if (*options.pp_peer_device == options.device) {
-            throw std::invalid_argument("Engine pipeline peer device must differ from device");
+    if (!options.pp_devices.empty()) {
+        if (options.pp_devices.size() < 2 || options.pp_devices.size() > 4) {
+            throw std::invalid_argument("Engine pipeline supports two to four devices");
+        }
+        if (options.pp_devices[0] != options.device) {
+            throw std::invalid_argument("Engine pipeline first device must match device");
+        }
+        for (std::size_t s = 0; s + 1 < options.pp_devices.size(); ++s) {
+            for (std::size_t t = s + 1; t < options.pp_devices.size(); ++t) {
+                if (options.pp_devices[s] == options.pp_devices[t]) {
+                    throw std::invalid_argument("Engine pipeline devices must be distinct");
+                }
+            }
         }
         if (options.enable_vision) {
             throw std::invalid_argument("Engine pipeline mode does not support Vision yet");
@@ -144,17 +154,25 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     target_finalize_phase.complete();
 
     std::unique_ptr<PpLink> pipeline;
-    std::unique_ptr<typename Target::LoadedModel> pipeline_rank1_model;
-    if (options.pp_peer_device.has_value()) {
-        pipeline = std::make_unique<PpLink>(device, *options.pp_peer_device);
-        DeviceContext& peer = pipeline->rank(1);
-        artifact::Binder binder1(reader);
-        auto load_plan1 = Target::plan_load(binder1, options, weights_profile);
-        auto materialized1 = artifact::materialize(reader, load_plan1.materialization(), peer,
-                                                   &options.startup_observer);
-        pipeline_rank1_model = Target::construct_loaded_model(std::move(load_plan1),
-                                                              std::move(materialized1));
-        peer.synchronize();
+    std::vector<std::unique_ptr<typename Target::LoadedModel>> stage_models;
+    if (!options.pp_devices.empty()) {
+        std::vector<DeviceContext*> rank_contexts{&device};
+        std::vector<std::unique_ptr<DeviceContext>> owned_peers;
+        for (std::size_t s = 1; s < options.pp_devices.size(); ++s) {
+            owned_peers.push_back(std::make_unique<DeviceContext>(options.pp_devices[s]));
+            rank_contexts.push_back(owned_peers.back().get());
+        }
+        pipeline = std::make_unique<PpLink>(rank_contexts);
+        for (std::size_t s = 1; s < options.pp_devices.size(); ++s) {
+            DeviceContext& peer = pipeline->rank(s);
+            artifact::Binder binder_s(reader);
+            auto load_plan_s = Target::plan_load(binder_s, options, weights_profile);
+            auto materialized_s = artifact::materialize(reader, load_plan_s.materialization(),
+                                                        peer, &options.startup_observer);
+            stage_models.push_back(
+                Target::construct_loaded_model(std::move(load_plan_s), std::move(materialized_s)));
+            peer.synchronize();
+        }
     }
 
     StartupPhaseScope frontend_phase(options.startup_observer, StartupPhase::FrontendInitialize);
@@ -165,7 +183,7 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     auto instance =
         std::make_unique<Instance>(std::move(loaded), capacity_resolution, std::move(sequence_plan),
                                    device, options.startup_observer, std::move(pipeline),
-                                   std::move(pipeline_rank1_model));
+                                   std::move(stage_models));
     device.synchronize();
     program_phase.complete();
     instance->kv_capacity_resolution.available_after_startup_bytes = current_free_device_bytes();
@@ -202,13 +220,18 @@ Qwen3_6_27BInstance::Qwen3_6_27BInstance(std::unique_ptr<LoadedQwen3_6_27B> stab
                                          DeviceContext& device,
                                          const StartupObserver& startup_observer,
                                          std::unique_ptr<PpLink> pipeline,
-                                         std::unique_ptr<Qwen3_6_27B::LoadedModel> pipeline_rank1_model)
+                                         std::vector<std::unique_ptr<Qwen3_6_27B::LoadedModel>> stage_models)
     : loaded(std::move(stable_loaded)), kv_capacity_resolution(resolution),
       capacity(sequence_plan.capacity()), pp(std::move(pipeline)),
-      rank1_model(std::move(pipeline_rank1_model)),
-      program(Qwen3_6_27B::create_program(
-          *loaded->model, std::move(sequence_plan), device, startup_observer,
-          Qwen3_6_27B::ProgramPipeline{.pp = pp.get(), .rank1_model = rank1_model.get()})) {}
+      stage_models(std::move(stage_models)),
+      program([&] {
+          std::vector<const Qwen3_6_27B::LoadedModel*> views;
+          views.reserve(this->stage_models.size());
+          for (const auto& model : this->stage_models) { views.push_back(model.get()); }
+          return Qwen3_6_27B::create_program(
+              *loaded->model, std::move(sequence_plan), device, startup_observer,
+              Qwen3_6_27B::ProgramPipeline{.pp = pp.get(), .stage_models = std::move(views)});
+      }()) {}
 
 Qwen3_6_27BInstance::~Qwen3_6_27BInstance() = default;
 
@@ -224,7 +247,7 @@ Qwen3_6_35BA3BInstance::Qwen3_6_35BA3BInstance(std::unique_ptr<LoadedQwen3_6_35B
                                                DeviceContext& device,
                                                const StartupObserver& startup_observer,
                                                std::unique_ptr<PpLink>,
-                                               std::unique_ptr<Qwen3_6_35BA3B::LoadedModel>)
+                                               std::vector<std::unique_ptr<Qwen3_6_35BA3B::LoadedModel>>)
     : loaded(std::move(stable_loaded)), kv_capacity_resolution(resolution),
       capacity(sequence_plan.capacity()),
       program(Qwen3_6_35BA3B::create_program(*loaded->model, std::move(sequence_plan), device,

@@ -1061,61 +1061,95 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
             throw std::invalid_argument("Qwen3.6 pipeline mode does not support Vision yet");
         }
         pp_link = seed.pp;
-        rank1.emplace();
-        DeviceContext& peer = seed.pp->rank(1);
-        peer.bind_to_current_thread();
-        rank1->persistent = std::make_unique<DeviceArena>(plan.persistent.bytes);
-        const DeviceSpan backing1 = rank1->persistent->alloc_bytes(plan.persistent.bytes, 256);
-        rank1->workspace_storage = std::make_unique<DeviceArena>(plan.workspace.capacity);
-        rank1->work = std::make_unique<WorkspaceArena>(
-            DeviceSpan{rank1->workspace_storage->base(), plan.workspace.general_capacity});
-        rank1->decoder = std::make_unique<qwen3_6::DecoderState>(backing1, plan.persistent.decoder);
-        decoder->text_kv.page_pool().set_mirror(rank1->decoder->text_kv.page_pool());
-        decoder->text_kv.execution_tables().set_mirror(
-            rank1->decoder->text_kv.execution_tables());
-        if (qwen3_6::PagedKVCache* backend1 = rank1->decoder->mtp_cache()) {
-            if (qwen3_6::PagedKVCache* backend0 = backend_kv_cache()) {
-                backend0->page_pool().set_mirror(backend1->page_pool());
-                backend0->execution_tables().set_mirror(backend1->execution_tables());
+        const std::size_t stage_count = seed.pp->rank_count();
+        if (seed.stage_models.size() + 1 != stage_count) {
+            throw std::invalid_argument(
+                "Qwen3.6 pipeline seed requires one model view per non-primary stage");
+        }
+        pp_stage_count = static_cast<std::uint32_t>(stage_count);
+        pp_stages.resize(stage_count - 1);
+        const std::uint32_t total_layers = static_cast<std::uint32_t>(TextConfig::layers);
+        const std::uint32_t base_split   = total_layers / stage_count;
+        for (std::size_t s = 1; s < stage_count; ++s) {
+            RankState& stage           = pp_stages[s - 1];
+            DeviceContext& peer        = seed.pp->rank(s);
+            peer.bind_to_current_thread();
+            stage.persistent = std::make_unique<DeviceArena>(plan.persistent.bytes);
+            const DeviceSpan backing_s = stage.persistent->alloc_bytes(plan.persistent.bytes, 256);
+            stage.workspace_storage = std::make_unique<DeviceArena>(plan.workspace.capacity);
+            stage.work = std::make_unique<WorkspaceArena>(
+                DeviceSpan{stage.workspace_storage->base(), plan.workspace.general_capacity});
+            stage.decoder =
+                std::make_unique<qwen3_6::DecoderState>(backing_s, plan.persistent.decoder);
+            qwen3_6::PagedKVCache& primary_text = s == 1 ? decoder->text_kv
+                                                        : pp_stages[s - 2].decoder->text_kv;
+            primary_text.page_pool().add_mirror(stage.decoder->text_kv.page_pool());
+            primary_text.execution_tables().add_mirror(stage.decoder->text_kv.execution_tables());
+            if (qwen3_6::PagedKVCache* backend_s = stage.decoder->mtp_cache()) {
+                qwen3_6::PagedKVCache* backend_prev =
+                    s == 1 ? backend_kv_cache() : pp_stages[s - 2].decoder->mtp_cache();
+                if (backend_prev != nullptr) {
+                    backend_prev->page_pool().add_mirror(backend_s->page_pool());
+                    backend_prev->execution_tables().add_mirror(backend_s->execution_tables());
+                }
             }
+            stage.state_images =
+                std::make_unique<qwen3_6::StateImageDevicePool>(backing_s,
+                                                                plan.persistent.state_images);
+            if (plan.persistent.replay_records) {
+                stage.replay_records.emplace(backing_s, *plan.persistent.replay_records);
+                stage.replay_fold.emplace(*stage.replay_records,
+                                          stage.state_images->linear().all_layers_view());
+            }
+            if (plan.persistent.mtp_lookup_replay_records) {
+                stage.mtp_lookup_replay_records.emplace(
+                    backing_s, *plan.persistent.mtp_lookup_replay_records);
+                stage.mtp_lookup_replay_fold.emplace(
+                    *stage.mtp_lookup_replay_records,
+                    stage.state_images->linear().all_layers_view());
+            }
+            stage.io.emplace(backing_s, plan.persistent.round);
+            stage.prefill_hidden = plan.persistent.prefill_hidden.bind(backing_s);
+            const std::size_t boundary_bytes =
+                static_cast<std::size_t>(prefill_chunk) *
+                static_cast<std::size_t>(TextConfig::hidden) * 2U;
+            void* boundary_ptr = nullptr;
+            CUDA_CHECK(cudaMalloc(&boundary_ptr, boundary_bytes));
+            stage.boundary = Tensor(boundary_ptr, DType::BF16,
+                                    {static_cast<std::int32_t>(TextConfig::hidden),
+                                     static_cast<std::int32_t>(prefill_chunk)});
+            stage.model = seed.stage_models[s - 1];
+            peer.synchronize();
         }
-        rank1->state_images =
-            std::make_unique<qwen3_6::StateImageDevicePool>(backing1, plan.persistent.state_images);
-        if (plan.persistent.replay_records) {
-            rank1->replay_records.emplace(backing1, *plan.persistent.replay_records);
-            rank1->replay_fold.emplace(*rank1->replay_records,
-                                       rank1->state_images->linear().all_layers_view());
-        }
-        if (plan.persistent.mtp_lookup_replay_records) {
-            rank1->mtp_lookup_replay_records.emplace(backing1,
-                                                     *plan.persistent.mtp_lookup_replay_records);
-            rank1->mtp_lookup_replay_fold.emplace(
-                *rank1->mtp_lookup_replay_records, rank1->state_images->linear().all_layers_view());
-        }
-        rank1->io.emplace(backing1, plan.persistent.round);
-        rank1->prefill_hidden = plan.persistent.prefill_hidden.bind(backing1);
-        const std::size_t boundary_bytes =
-            static_cast<std::size_t>(prefill_chunk) * static_cast<std::size_t>(TextConfig::hidden) * 2U;
-        void* boundary_ptr = nullptr;
-        CUDA_CHECK(cudaMalloc(&boundary_ptr, boundary_bytes));
-        rank1->boundary = Tensor(boundary_ptr, DType::BF16,
-                                 {static_cast<std::int32_t>(TextConfig::hidden),
-                                  static_cast<std::int32_t>(prefill_chunk)});
-        rank1->model = seed.rank1_model;
-        if (seed.rank1_model == nullptr) {
-            throw std::invalid_argument("Qwen3.6 pipeline seed requires a rank-1 model view");
-        }
-        pp_split = static_cast<std::uint32_t>(TextConfig::layers) / 2U;
-        for (std::uint32_t l = 0; l < pp_split; ++l) {
-            if (l >= 3 && (l - 3) % 4 == 0) { ++pp_attn_count; }
+        device_in.synchronize();
+        // Stage layer ranges: contiguous, remainder to the LAST stage so attention-layer
+        // grouping (3 GDN + 1 full per 4) stays aligned on every earlier stage.
+        pp_begins.assign(stage_count, 0);
+        pp_ends.assign(stage_count, 0);
+        pp_gdn_offsets.assign(stage_count, 0);
+        pp_attn_offsets.assign(stage_count, 0);
+        std::uint32_t cursor_layers = 0;
+        std::uint32_t gdn_cursor    = 0;
+        std::uint32_t attn_cursor   = 0;
+        for (std::size_t s = 0; s < stage_count; ++s) {
+            const std::uint32_t span =
+                s + 1 == stage_count ? total_layers - cursor_layers : base_split;
+            pp_begins[s] = cursor_layers;
+            pp_ends[s]   = cursor_layers + span;
+            pp_gdn_offsets[s] = gdn_cursor;
+            pp_attn_offsets[s] = attn_cursor;
+            for (std::uint32_t l = cursor_layers; l < cursor_layers + span; ++l) {
+                if (l >= 3 && (l - 3) % 4 == 0) { ++attn_cursor; } else { ++gdn_cursor; }
+            }
+            cursor_layers += span;
         }
         if (speculative_backend != SpeculativeBackend::None) {
             throw std::invalid_argument(
                 "Qwen3.6 pipeline V1 requires speculative decoding to be disabled");
         }
-        pp_link->arm_zero_wait(0, kPpSiteAck);
-        peer.synchronize();
-        device_in.synchronize();
+        for (std::size_t s = 0; s + 1 < stage_count; ++s) {
+            pp_link->arm_zero_wait(s, kPpSiteAckBase + s);
+        }
     }
 
     work.reset();
@@ -11032,26 +11066,29 @@ qwen3_6::PagedKVCacheView ProgramImplCore::text_kv_view(const SequenceState& seq
     return decoder->text_kv.execution_view(text_kv_addresses->execution_row(sequence.kv->text));
 }
 
-qwen3_6::PagedKVCacheView ProgramImplCore::text_kv_view1(const SequenceState& sequence) const {
-    if (!rank1 || !sequence.kv) {
+qwen3_6::PagedKVCacheView ProgramImplCore::text_kv_view_stage(
+    std::size_t stage, const SequenceState& sequence) const {
+    if (stage == 0 || stage > pp_stages.size() || !sequence.kv) {
         throw std::logic_error("sequence has no active KV execution mapping");
     }
-    return rank1->decoder->text_kv.execution_view_unchecked(
+    return pp_stages[stage - 1].decoder->text_kv.execution_view_unchecked(
         text_kv_addresses->bound_row(sequence.kv->text));
 }
 
-qwen3_6::PagedKVCacheView ProgramImplCore::mtp_kv_view1(const SequenceState& sequence) const {
+qwen3_6::PagedKVCacheView ProgramImplCore::mtp_kv_view_stage(
+    std::size_t stage, const SequenceState& sequence) const {
     if (speculative_backend != SpeculativeBackend::Mtp) { return {}; }
-    if (rank1->decoder->mtp_cache() == nullptr || !sequence.kv || !sequence.kv->backend ||
-        !backend_kv_addresses->active(*sequence.kv->backend)) {
+    if (pp_stages[stage - 1].decoder->mtp_cache() == nullptr || !sequence.kv ||
+        !sequence.kv->backend || !backend_kv_addresses->active(*sequence.kv->backend)) {
         throw std::logic_error("sequence has no active MTP KV execution mapping");
     }
-    return rank1->decoder->mtp_cache()->execution_view_unchecked(
+    return pp_stages[stage - 1].decoder->mtp_cache()->execution_view_unchecked(
         backend_kv_addresses->bound_row(*sequence.kv->backend));
 }
 
 schedule::ExecutionCore ProgramImplCore::rank_core(std::size_t rank, const GdnReplayRecords* records,
-                                                   std::size_t hidden_site) {
+                                                   std::size_t hidden_site_base) {
+    if (rank >= pp_stage_count) { throw std::logic_error("pipeline stage is missing"); }
     if (rank == 0) {
         return schedule::ExecutionCore{device,
                                        model,
@@ -11062,37 +11099,40 @@ schedule::ExecutionCore ProgramImplCore::rank_core(std::size_t rank, const GdnRe
                                        prefill_hidden,
                                        prefill_chunk,
                                        proposal_head,
-                                       0,
-                                       pp_split,
-                                       0,
-                                       0,
+                                       pp_begins[0],
+                                       pp_ends[0],
+                                       pp_gdn_offsets[0],
+                                       pp_attn_offsets[0],
                                        pp_link,
-                                       hidden_site,
                                        0,
-                                       rank1.has_value() ? rank1->boundary.data : nullptr,
+                                       pp_stage_count > 1 ? hidden_site_base : 0,
+                                       0,
+                                       pp_stage_count > 1 ? pp_stages[0].boundary.data : nullptr,
                                        0,
                                        nullptr};
     }
-    if (!rank1) { throw std::logic_error("pipeline rank-1 state is missing"); }
-    return schedule::ExecutionCore{pp_link->rank(1),
-                                   *rank1->model,
-                                   *rank1->work,
-                                   rank1->state_images->linear(),
+    RankState& stage = pp_stages[rank - 1];
+    return schedule::ExecutionCore{pp_link->rank(rank),
+                                   *stage.model,
+                                   *stage.work,
+                                   stage.state_images->linear(),
                                    records,
-                                   *rank1->io,
-                                   rank1->prefill_hidden,
+                                   *stage.io,
+                                   stage.prefill_hidden,
                                    prefill_chunk,
                                    proposal_head,
-                                   pp_split,
-                                   static_cast<std::uint32_t>(TextConfig::layers),
-                                   pp_split - static_cast<std::uint32_t>(pp_attn_count),
-                                   static_cast<std::uint32_t>(pp_attn_count),
+                                   pp_begins[rank],
+                                   pp_ends[rank],
+                                   pp_gdn_offsets[rank],
+                                   pp_attn_offsets[rank],
                                    pp_link,
-                                   hidden_site,
-                                   1,
-                                   nullptr,
+                                   hidden_site_base + rank - 1,
+                                   rank + 1 < pp_stage_count ? hidden_site_base + rank : 0,
+                                   rank,
+                                   rank + 1 < pp_stage_count ? pp_stages[rank].boundary.data
+                                                             : nullptr,
                                    0,
-                                   rank1->boundary.data};
+                                   stage.boundary.data};
 }
 
 qwen3_6::PagedKVCacheView ProgramImplCore::mtp_kv_view(const SequenceState& sequence) const {
@@ -11702,7 +11742,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
             rewrite_capture_hidden_ptr = &rewrite_capture_hidden;
         }
         schedule::PrefillContext schedule_state{
-            {rank_core(0, replay_records ? &*replay_records : nullptr, kPpSitePrefill)},
+            {rank_core(0, replay_records ? &*replay_records : nullptr, kPpSitePrefillBase)},
             text_kv_view(sequence),
             mtp_kv_view(sequence),
             decoder->text_kv,
@@ -11716,15 +11756,16 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
             selectors.destination,
             staged.initial_mtp_extent,
             dflash_host_ingress};
-        std::optional<schedule::PrefillContext> schedule_state1;
+        const std::size_t pp_stage_total = pp_link != nullptr ? pp_link->rank_count() : 1;
+        std::vector<schedule::PrefillContext> stage_ctxs;
         if (pp_link != nullptr) {
-            schedule_state1.emplace(
-                schedule::PrefillContext{
-                    {rank_core(1, nullptr, kPpSitePrefill)},
-                    text_kv_view1(sequence),
-                    mtp_kv_view1(sequence),
-                    rank1->decoder->text_kv,
-                    rank1->decoder->mtp_cache(),
+            for (std::size_t s = 1; s < pp_stage_total; ++s) {
+                stage_ctxs.emplace_back(schedule::PrefillContext{
+                    {rank_core(s, nullptr, kPpSitePrefillBase)},
+                    text_kv_view_stage(s, sequence),
+                    mtp_kv_view_stage(s, sequence),
+                    pp_stages[s - 1].decoder->text_kv,
+                    pp_stages[s - 1].decoder->mtp_cache(),
                     nullptr,
                     staged.cursor,
                     static_cast<const ops::SamplingConfig*>(
@@ -11734,6 +11775,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                     selectors.destination,
                     staged.initial_mtp_extent,
                     nullptr});
+            }
         }
 
         if (staged.mtp_bridge == MtpBridgeMode::BeforeSuffix) {
@@ -11816,33 +11858,42 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                                                                 *staged.vision, remaining,
                                                                 split_frontier, final_candidate);
                 } else {
-                    if (pp_link != nullptr) {
-                        pp_link->wait(0, kPpSiteAck);
-                        pp_link->rank(0).bind_to_current_thread();
-                    }
-                    result = schedule::prefill_text_chunk(
-                        schedule_state, std::span<const TokenId>(staged.prompt.token_ids),
-                        remaining, split_frontier, final_candidate);
-                    if (pp_link != nullptr) {
-                        pp_link->rank(1).bind_to_current_thread();
-                        schedule_state1->text_kv_base           = schedule_state.text_kv_base;
-                        schedule_state1->state_source_slot      = schedule_state.state_source_slot;
-                        schedule_state1->state_destination_slot =
-                            schedule_state.state_destination_slot;
-                        schedule::prefill_text_chunk(
-                            *schedule_state1, std::span<const TokenId>(staged.prompt.token_ids),
-                            remaining, split_frontier, final_candidate);
-                        if (final_candidate) {
-                            // The last rank owns prefill sampling; publish its token into the
-                            // rank-0 round state the Engine consumes (peer copy on rank0's
-                            // stream, ordered before the host read-back).
-                            CUDA_CHECK(cudaMemcpyAsync(io.token.data, rank1->io->token.data,
-                                                       io.token.bytes(), cudaMemcpyDeviceToDevice,
-                                                       device.stream));
+                    for (std::size_t s = 0; s < pp_stage_total; ++s) {
+                        if (pp_link != nullptr) {
+                            if (s + 1 < pp_stage_total) {
+                                pp_link->wait_done(s, kPpSiteAckBase + s);
+                            }
+                            pp_link->rank(s).bind_to_current_thread();
                         }
-                        pp_link->rank(0).bind_to_current_thread();
-                        pp_link->signal(1, kPpSiteAck);
+                        if (s == 0) {
+                            result = schedule::prefill_text_chunk(
+                                schedule_state, std::span<const TokenId>(staged.prompt.token_ids),
+                                remaining, split_frontier, final_candidate);
+                        } else {
+                            stage_ctxs[s - 1].text_kv_base = schedule_state.text_kv_base;
+                            stage_ctxs[s - 1].state_source_slot =
+                                schedule_state.state_source_slot;
+                            stage_ctxs[s - 1].state_destination_slot =
+                                schedule_state.state_destination_slot;
+                            schedule::prefill_text_chunk(
+                                stage_ctxs[s - 1],
+                                std::span<const TokenId>(staged.prompt.token_ids), remaining,
+                                split_frontier, final_candidate);
+                        }
+                        if (pp_link != nullptr && s + 1 == pp_stage_total && final_candidate) {
+                            // The last stage owns prefill sampling; publish its token into
+                            // the primary round state the Engine consumes (peer copy on the
+                            // primary stream, ordered before the host read-back).
+                            pp_link->rank(0).bind_to_current_thread();
+                            CUDA_CHECK(cudaMemcpyAsync(
+                                io.token.data, pp_stages.back().io->token.data, io.token.bytes(),
+                                cudaMemcpyDeviceToDevice, device.stream));
+                        }
+                        if (pp_link != nullptr && s > 0) {
+                            pp_link->signal_done(s, kPpSiteAckBase + s - 1);
+                        }
                     }
+                    if (pp_link != nullptr) { pp_link->rank(0).bind_to_current_thread(); }
                 }
                 timing.include(result.timing);
                 timing.resume_post();
@@ -12070,7 +12121,7 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             ensure_sequence_kv_mapped(sequence, frontier + 1, 0);
         }
 
-        schedule::OrdinaryBatchContext schedule_state{{rank_core(0, nullptr, kPpSiteVerify)},
+        schedule::OrdinaryBatchContext schedule_state{{rank_core(0, nullptr, kPpSiteVerifyBase)},
                                                       decoder->text_kv,
                                                       *io.ordinary,
                                                       *ordinary_host_ingress,
@@ -12078,26 +12129,38 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
                                                       state_images->continuation_hidden_store()};
 
         mark_workspace_usage(workspace_plan.ordinary_round);
+        const std::size_t pp_stage_total = pp_link != nullptr ? pp_link->rank_count() : 1;
+        std::vector<schedule::OrdinaryBatchContext> stage_ctxs;
         if (pp_link != nullptr) {
-            pp_link->wait(0, kPpSiteAck);
-            pp_link->rank(0).bind_to_current_thread();
+            for (std::size_t s = 1; s < pp_stage_total; ++s) {
+                stage_ctxs.emplace_back(schedule::OrdinaryBatchContext{
+                    {rank_core(s, nullptr, kPpSiteVerifyBase)},
+                    pp_stages[s - 1].decoder->text_kv,
+                    *pp_stages[s - 1].io->ordinary,
+                    *ordinary_host_ingress,
+                    *ordinary_host_egress,
+                    pp_stages[s - 1].state_images->continuation_hidden_store()});
+            }
         }
-        schedule::ordinary_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
-                                        envelope, executable);
-        if (pp_link != nullptr) {
-            pp_link->rank(1).bind_to_current_thread();
-            schedule::OrdinaryBatchContext schedule_state1{
-                {rank_core(1, nullptr, kPpSiteVerify)},
-                rank1->decoder->text_kv,
-                *rank1->io->ordinary,
-                *ordinary_host_ingress,
-                *ordinary_host_egress,
-                rank1->state_images->continuation_hidden_store()};
-            schedule::ordinary_decode_batch(schedule_state1, static_cast<std::int32_t>(lanes.size()),
-                                            envelope, nullptr);
-            pp_link->rank(0).bind_to_current_thread();
-            pp_link->signal(1, kPpSiteAck);
+        for (std::size_t s = 0; s < pp_stage_total; ++s) {
+            if (pp_link != nullptr) {
+                if (s + 1 < pp_stage_total) { pp_link->wait_done(s, kPpSiteAckBase + s); }
+                pp_link->rank(s).bind_to_current_thread();
+            }
+            if (s == 0) {
+                schedule::ordinary_decode_batch(schedule_state,
+                                                static_cast<std::int32_t>(lanes.size()),
+                                                envelope, executable);
+            } else {
+                schedule::ordinary_decode_batch(stage_ctxs[s - 1],
+                                                static_cast<std::int32_t>(lanes.size()),
+                                                envelope, nullptr);
+            }
+            if (pp_link != nullptr && s > 0) {
+                pp_link->signal_done(s, kPpSiteAckBase + s - 1);
+            }
         }
+        if (pp_link != nullptr) { pp_link->rank(0).bind_to_current_thread(); }
         submit_range.reset();
         timing.begin_wait();
         {

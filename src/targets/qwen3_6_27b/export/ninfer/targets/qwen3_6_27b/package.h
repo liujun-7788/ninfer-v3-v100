@@ -136,8 +136,8 @@ struct Package {
                                                                const EngineOptions& options,
                                                                WeightsProfile weights_profile);
     struct ProgramPipeline {
-        ninfer::PpLink* pp             = nullptr;
-        const LoadedModel* rank1_model = nullptr;
+        ninfer::PpLink* pp                   = nullptr;
+        std::vector<const LoadedModel*> stage_models;  // stages 1..N-1, in order
     };
     [[nodiscard]] static std::unique_ptr<Program>
     create_program(const LoadedModel& model, SequencePlan&& plan, DeviceContext& device,

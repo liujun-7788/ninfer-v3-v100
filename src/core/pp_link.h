@@ -2,31 +2,33 @@
 
 #include "core/device.h"
 
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 namespace ninfer {
 
-inline constexpr std::size_t kPpMaxSites = 64;
+inline constexpr std::size_t kPpMaxSites = 256;
+inline constexpr std::size_t kPpMaxRanks = 8;
 
-// One-directional hidden-state link between two pipeline ranks over peer access. The
-// producer pushes a buffer into the consumer's staging area (posted remote writes) and
-// publishes a generation to a host-pinned mailbox; the consumer's stream gates behind that
-// generation with a wait kernel. Both counters advance once per round on their own device,
-// so the same launch sequence stays correct under CUDA Graph replay.
+// Linear-pipeline link over peer-accessible GPUs. Ranks are ordered; data flows only
+// between adjacent ranks (r pushes into r+1's staging). Every channel (one direction of
+// one adjacent pair) has a monotone generation published in a host-pinned mailbox — PCIe
+// coherence makes host memory the safe signaling medium, and one writer per channel word
+// keeps values from regressing. Counters advance on device, keeping CUDA Graph replays in
+// lockstep without host involvement.
 //
-// The link owns no model state. All buffers are caller-provided; the consumer staging
-// buffer lives on the consumer's device and must stay stable across graph captures.
+// Channel roles are split: counter_tx counts a rank's outgoing publications, counter_rx
+// counts its incoming waits. Both advance once per round per site, so each channel's
+// generations stay in lockstep.
+//
+// Non-owning: the caller keeps every rank DeviceContext alive (the engine owns the
+// primary; a bundle owning peer contexts may sit beside the link).
 class PpLink {
 public:
-    static constexpr std::size_t kRankCount = 2;
-
-    // Non-owning pair: the caller keeps both rank DeviceContexts alive.
-    PpLink(DeviceContext& rank0, DeviceContext& rank1);
-    // Owning peer: the primary context stays caller-owned; the peer DeviceContext is
-    // created (and owned) by the link — the engine-level entry point.
+    explicit PpLink(std::vector<DeviceContext*> ranks);
+    // Owning-peer convenience for the two-rank entry point (engine keeps rank0).
     PpLink(DeviceContext& rank0, int peer_device);
     ~PpLink();
 
@@ -35,40 +37,45 @@ public:
     PpLink(PpLink&& other) noexcept;
     PpLink& operator=(PpLink&& other) noexcept;
 
+    [[nodiscard]] std::size_t rank_count() const noexcept { return ranks_.size(); }
     [[nodiscard]] DeviceContext& rank(std::size_t index);
     [[nodiscard]] const DeviceContext& rank(std::size_t index) const;
 
-    // Enqueue on the producer's stream: copy source (producer device) into destination
-    // (consumer device) and publish the round. Consumer staging may be reallocated between
-    // rounds but must be stable within one capture.
-    void push(std::size_t producer, const void* source, void* consumer_staging,
-              std::size_t bytes, std::size_t site);
+    // Enqueue on the producer's stream: copy its input into the next rank's staging and
+    // publish the round on the (producer, site) channel.
+    void push(std::size_t producer, std::size_t site, const void* source, void* consumer_staging,
+              std::size_t bytes);
 
-    // Enqueue on the consumer's stream: block until this round's push is visible.
-    void wait(std::size_t consumer, std::size_t site);
+    // Enqueue on the consumer's stream: block until this round's push from the previous
+    // rank is visible.
+    void wait_input(std::size_t consumer, std::size_t site);
 
-    // One-time setup for a wait site whose first round must pass without a preceding push
-    // (the decode turnstile: rank0 round N+1 gates on rank1's round-N completion signal,
-    // so the very first round must fall through). Initializes the consumer's counter so its
-    // first expected generation is zero.
-    void arm_zero_wait(std::size_t consumer, std::size_t site);
+    // Enqueue on the rank's stream: publish a completion generation without a transfer
+    // (reverse-direction acks for the decode turnstile).
+    void signal_done(std::size_t rank, std::size_t site);
 
-    // Enqueue on the rank's stream: publish this round's generation without a transfer
-    // (reverse-direction completion acks for the decode turnstile).
-    void signal(std::size_t rank, std::size_t site);
+    // Enqueue on the rank's stream: block until the next rank's completion reaches this
+    // round (decode turnstile; rank must not be the last).
+    void wait_done(std::size_t rank, std::size_t site);
+
+    // One-time setup for a wait site whose first round must pass without a preceding
+    // publication (the decode turnstile head). Initializes the rank's receive counter so
+    // its first expected generation is zero.
+    void arm_zero_wait(std::size_t rank, std::size_t site);
 
 private:
     struct Mailbox {
-        unsigned long long flag[kRankCount][kPpMaxSites];
+        unsigned long long flag[kPpMaxRanks][kPpMaxSites];
+        unsigned long long counter_tx[kPpMaxRanks][kPpMaxSites];
+        unsigned long long counter_rx[kPpMaxRanks][kPpMaxSites];
     };
 
     void enable_peer_access();
     void init_mailbox();
 
+    std::vector<DeviceContext*> ranks_;
+    Mailbox* mailbox_ = nullptr;
     std::unique_ptr<DeviceContext> peer_owner_;
-    std::array<DeviceContext*, kRankCount> ranks_{};
-    Mailbox* mailbox_                         = nullptr;
-    unsigned long long* counters_[kRankCount] = {nullptr, nullptr};
 };
 
 } // namespace ninfer

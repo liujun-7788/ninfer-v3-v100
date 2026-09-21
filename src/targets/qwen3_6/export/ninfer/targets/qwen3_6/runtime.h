@@ -837,8 +837,8 @@ struct ReleaseResult {
 // split across ranks; rank1_model is the second full model view loaded on the peer device.
 template <class Variant>
 struct ProgramPipelineSeed {
-    PpLink* pp                              = nullptr;
-    const typename Variant::ModelView* rank1_model = nullptr;
+    PpLink* pp                                     = nullptr;
+    std::vector<const typename Variant::ModelView*> stage_models;  // stages 1..N-1, in order
 };
 
 template <class Variant>

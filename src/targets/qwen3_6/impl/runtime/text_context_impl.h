@@ -1042,12 +1042,15 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                                        : pipeline_.layer_end;
     if (pp_begin != 0) {
         if (pipeline_.pp != nullptr) {
-            pipeline_.pp->wait(pipeline_.pp_rank, pipeline_.pp_site);
+            pipeline_.pp->wait_input(pipeline_.pp_rank, pipeline_.pp_site_in);
         }
         CUDA_CHECK(cudaMemcpyAsync(x.data, pipeline_.boundary_local,
                                    x.numel() * sizeof(std::uint16_t), cudaMemcpyDeviceToDevice,
                                    ctx_.stream));
         if (std::getenv("NINFER_PP_DEBUG") != nullptr) {
+            cudaStreamCaptureStatus pp_cap = cudaStreamCaptureStatusNone;
+            CUDA_CHECK(cudaStreamIsCapturing(ctx_.stream, &pp_cap));
+            if (pp_cap == cudaStreamCaptureStatusNone) {
             static std::uint16_t host[8] = {};
             CUDA_CHECK(cudaMemcpyAsync(host, x.data, sizeof(host), cudaMemcpyDeviceToHost,
                                        ctx_.stream));
@@ -1057,6 +1060,7 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                          __bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&host[1])),
                          __bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&host[2])),
                          __bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&host[3])));
+            }
         }
     }
     for (std::uint32_t layer = pp_begin; layer < pp_end; ++layer) {
@@ -1105,7 +1109,10 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
         }
     }
     if (pp_end < static_cast<std::uint32_t>(kCfg.n_layers) && pipeline_.pp != nullptr) {
-        if (std::getenv("NINFER_PP_DEBUG") != nullptr) {
+        cudaStreamCaptureStatus pp_cap = cudaStreamCaptureStatusNone;
+        CUDA_CHECK(cudaStreamIsCapturing(ctx_.stream, &pp_cap));
+        if (std::getenv("NINFER_PP_DEBUG") != nullptr &&
+            pp_cap == cudaStreamCaptureStatusNone) {
             static std::uint16_t host[8] = {};
             CUDA_CHECK(cudaMemcpyAsync(host, x.data, sizeof(host), cudaMemcpyDeviceToHost,
                                        ctx_.stream));
@@ -1116,8 +1123,24 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                          __bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&host[2])),
                          __bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&host[3])));
         }
-        pipeline_.pp->push(pipeline_.pp_rank, x.data, pipeline_.peer_hidden,
-                           x.numel() * sizeof(std::uint16_t), pipeline_.pp_site);
+        pipeline_.pp->push(pipeline_.pp_rank, pipeline_.pp_site_out, x.data,
+                           pipeline_.peer_hidden, x.numel() * sizeof(std::uint16_t));
+    }
+    cudaStreamCaptureStatus pp_cap = cudaStreamCaptureStatusNone;
+    CUDA_CHECK(cudaStreamIsCapturing(ctx_.stream, &pp_cap));
+    if (std::getenv("NINFER_PP_DEBUG") != nullptr && pp_cap == cudaStreamCaptureStatusNone &&
+        pipeline_.layer_begin == 0 &&
+        (pipeline_.layer_end == 0 ||
+         pipeline_.layer_end >= static_cast<std::uint32_t>(kCfg.n_layers))) {
+        static std::uint16_t host[8] = {};
+        CUDA_CHECK(cudaMemcpyAsync(host, x.data, sizeof(host), cudaMemcpyDeviceToHost,
+                                   ctx_.stream));
+        CUDA_CHECK(cudaStreamSynchronize(ctx_.stream));
+        std::fprintf(stderr, "[PP] final-x  x0..7 = %g %g %g %g\n",
+                     __bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&host[0])),
+                     __bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&host[1])),
+                     __bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&host[2])),
+                     __bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&host[3])));
     }
 }
 
@@ -1290,6 +1313,17 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                                 ops::kSamplePurposePrefill, work_, s);
                 } else {
                     ops::argmax(logits, io_.token, kCfg.token_domain, s);
+                }
+                cudaStreamCaptureStatus pp_cap = cudaStreamCaptureStatusNone;
+                CUDA_CHECK(cudaStreamIsCapturing(s, &pp_cap));
+                if (std::getenv("NINFER_PP_DEBUG") != nullptr &&
+                    pp_cap == cudaStreamCaptureStatusNone) {
+                    TokenId tok = 0;
+                    CUDA_CHECK(cudaMemcpyAsync(&tok, io_.token.data, sizeof(tok),
+                                               cudaMemcpyDeviceToHost, s));
+                    CUDA_CHECK(cudaStreamSynchronize(s));
+                    std::fprintf(stderr, "[PP] prefill first token = %u\n",
+                                 static_cast<unsigned>(tok));
                 }
             }
 
