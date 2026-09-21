@@ -59,6 +59,7 @@ struct ExecutionCore {
     std::size_t pp_rank            = 0;
     void* peer_hidden              = nullptr;
     std::size_t peer_hidden_bytes  = 0;
+    void* boundary_local           = nullptr;
 
     [[nodiscard]] bool pipeline_first() const noexcept { return layer_begin == 0; }
     // layer_end == 0 means "unset" = full range (existing aggregate-init call sites).

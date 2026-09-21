@@ -704,8 +704,9 @@ public:
         const LoadedModelData* model = nullptr;
     };
     std::optional<RankState> rank1;
-    PpLink* pp_link          = nullptr;
-    std::uint32_t pp_split   = 0;
+    PpLink* pp_link              = nullptr;
+    std::uint32_t pp_split       = 0;
+    std::uint32_t pp_attn_count  = 0;
 
     PinnedHostBuffer round_host;
     std::optional<PinnedHostBuffer> score_logprobs_host;
@@ -1276,6 +1277,14 @@ private:
     [[nodiscard]] const qwen3_6::PagedKVCache* backend_kv_cache() const noexcept;
     [[nodiscard]] std::uint32_t backend_kv_valid(const SequenceState& sequence) const noexcept;
     [[nodiscard]] qwen3_6::PagedKVCacheView text_kv_view(const SequenceState& sequence) const;
+    [[nodiscard]] qwen3_6::PagedKVCacheView text_kv_view1(const SequenceState& sequence) const;
+    [[nodiscard]] qwen3_6::PagedKVCacheView mtp_kv_view1(const SequenceState& sequence) const;
+    [[nodiscard]] schedule::ExecutionCore rank_core(std::size_t rank, const GdnReplayRecords* records,
+                                                    std::size_t hidden_site);
+    static constexpr std::size_t kPpSitePrefill = 0;
+    static constexpr std::size_t kPpSiteVerify  = 1;
+    static constexpr std::size_t kPpSiteMtp     = 2;
+    static constexpr std::size_t kPpSiteAck     = 3;
     [[nodiscard]] qwen3_6::PagedKVCacheView mtp_kv_view(const SequenceState& sequence) const;
 };
 
