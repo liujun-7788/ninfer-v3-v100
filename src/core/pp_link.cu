@@ -46,9 +46,11 @@ __global__ void pp_wait_kernel(unsigned long long* counter,
 
 } // namespace
 
-PpLink::PpLink(std::vector<DeviceContext> contexts) : ranks_(std::move(contexts)) {
-    if (ranks_.size() != kRankCount) {
-        throw std::invalid_argument("PpLink requires exactly two rank devices");
+PpLink::PpLink(DeviceContext& rank0, DeviceContext& rank1) {
+    ranks_[0] = &rank0;
+    ranks_[1] = &rank1;
+    if (ranks_[0]->device == ranks_[1]->device) {
+        throw std::invalid_argument("PpLink requires two distinct devices");
     }
     enable_peer_access();
     const cudaError_t err = cudaHostAlloc(&mailbox_, sizeof(Mailbox),
@@ -59,22 +61,22 @@ PpLink::PpLink(std::vector<DeviceContext> contexts) : ranks_(std::move(contexts)
     std::fill(&mailbox_->flag[0][0],
               &mailbox_->flag[0][0] + sizeof(Mailbox) / sizeof(unsigned long long), 0ULL);
     for (std::size_t r = 0; r < kRankCount; ++r) {
-        ranks_[r].bind_to_current_thread();
+        ranks_[r]->bind_to_current_thread();
         const cudaError_t counter_err =
             cudaMalloc(&counters_[r], kPpMaxSites * sizeof(unsigned long long));
         if (counter_err != cudaSuccess) {
             throw std::runtime_error(pp_cuda_error("PpLink counter cudaMalloc failed", counter_err));
         }
         CUDA_CHECK(cudaMemsetAsync(counters_[r], 0, kPpMaxSites * sizeof(unsigned long long),
-                                   ranks_[r].stream));
-        CUDA_CHECK(cudaStreamSynchronize(ranks_[r].stream));
+                                   ranks_[r]->stream));
+        CUDA_CHECK(cudaStreamSynchronize(ranks_[r]->stream));
     }
 }
 
 PpLink::~PpLink() {
     for (std::size_t r = 0; r < kRankCount; ++r) {
         if (counters_[r] != nullptr) {
-            ranks_[r].bind_to_current_thread_noexcept();
+            ranks_[r]->bind_to_current_thread_noexcept();
             static_cast<void>(cudaFree(counters_[r]));
             counters_[r] = nullptr;
         }
@@ -85,39 +87,41 @@ PpLink::~PpLink() {
     }
 }
 
-PpLink::PpLink(PpLink&& other) noexcept : ranks_(std::move(other.ranks_)) {
-    mailbox_ = std::exchange(other.mailbox_, nullptr);
+PpLink::PpLink(PpLink&& other) noexcept
+    : ranks_(other.ranks_), mailbox_(std::exchange(other.mailbox_, nullptr)) {
     for (std::size_t r = 0; r < kRankCount; ++r) {
-        counters_[r]       = other.counters_[r];
-        other.counters_[r] = nullptr;
+        counters_[r] = std::exchange(other.counters_[r], nullptr);
     }
 }
 
 PpLink& PpLink::operator=(PpLink&& other) noexcept {
     if (this == &other) { return *this; }
-    ranks_   = std::move(other.ranks_);
+    ranks_   = other.ranks_;
     mailbox_ = std::exchange(other.mailbox_, nullptr);
     for (std::size_t r = 0; r < kRankCount; ++r) {
-        counters_[r]       = other.counters_[r];
-        other.counters_[r] = nullptr;
+        counters_[r] = std::exchange(other.counters_[r], nullptr);
     }
     return *this;
 }
 
 DeviceContext& PpLink::rank(std::size_t index) {
-    if (index >= ranks_.size()) { throw std::out_of_range("PpLink rank index"); }
-    return ranks_[index];
+    if (index >= kRankCount || ranks_[index] == nullptr) {
+        throw std::out_of_range("PpLink rank index");
+    }
+    return *ranks_[index];
 }
 
 const DeviceContext& PpLink::rank(std::size_t index) const {
-    if (index >= ranks_.size()) { throw std::out_of_range("PpLink rank index"); }
-    return ranks_[index];
+    if (index >= kRankCount || ranks_[index] == nullptr) {
+        throw std::out_of_range("PpLink rank index");
+    }
+    return *ranks_[index];
 }
 
 void PpLink::enable_peer_access() {
     for (std::size_t r = 0; r < kRankCount; ++r) {
-        DeviceContext& ctx    = ranks_[r];
-        const int peer_device = ranks_[r ^ 1].device;
+        DeviceContext& ctx    = *ranks_[r];
+        const int peer_device = ranks_[r ^ 1]->device;
         int accessible        = 0;
         CUDA_CHECK(cudaDeviceCanAccessPeer(&accessible, ctx.device, peer_device));
         if (accessible == 0) {
@@ -145,7 +149,7 @@ void PpLink::push(std::size_t producer, const void* source, void* consumer_stagi
     if ((bytes & 15) != 0) {
         throw std::invalid_argument("PpLink push bytes must be a multiple of 16");
     }
-    DeviceContext& ctx = ranks_[producer];
+    DeviceContext& ctx = *ranks_[producer];
     ctx.bind_to_current_thread();
     const long long count_vec8 = static_cast<long long>(bytes / 16);
     constexpr int kBlock       = 256;
@@ -164,7 +168,7 @@ void PpLink::wait(std::size_t consumer, std::size_t site) {
     if (consumer >= kRankCount || site >= kPpMaxSites) {
         throw std::out_of_range("PpLink wait index");
     }
-    DeviceContext& ctx = ranks_[consumer];
+    DeviceContext& ctx = *ranks_[consumer];
     ctx.bind_to_current_thread();
     pp_wait_kernel<<<1, 32, 0, ctx.stream>>>(counters_[consumer] + site,
                                              mailbox_->flag[consumer ^ 1] + site);
@@ -175,7 +179,7 @@ void PpLink::arm_zero_wait(std::size_t consumer, std::size_t site) {
     if (consumer >= kRankCount || site >= kPpMaxSites) {
         throw std::out_of_range("PpLink arm index");
     }
-    ranks_[consumer].bind_to_current_thread();
+    ranks_[consumer]->bind_to_current_thread();
     const unsigned long long minus_one = ~0ULL;
     CUDA_CHECK(cudaMemcpy(counters_[consumer] + site, &minus_one, sizeof(minus_one),
                           cudaMemcpyHostToDevice));
@@ -185,7 +189,7 @@ void PpLink::signal(std::size_t rank, std::size_t site) {
     if (rank >= kRankCount || site >= kPpMaxSites) {
         throw std::out_of_range("PpLink signal index");
     }
-    DeviceContext& ctx = ranks_[rank];
+    DeviceContext& ctx = *ranks_[rank];
     ctx.bind_to_current_thread();
     pp_signal_kernel<<<1, 32, 0, ctx.stream>>>(counters_[rank] + site,
                                                mailbox_->flag[rank] + site);

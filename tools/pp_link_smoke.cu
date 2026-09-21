@@ -16,10 +16,9 @@ int main(int argc, char** argv) {
     const int dev0 = argc > 1 ? atoi(argv[1]) : 0;
     const int dev1 = argc > 2 ? atoi(argv[2]) : 1;
 
-    std::vector<DeviceContext> contexts;
-    contexts.emplace_back(dev0);
-    contexts.emplace_back(dev1);
-    PpLink link(std::move(contexts));
+    DeviceContext ctx0(dev0);
+    DeviceContext ctx1(dev1);
+    PpLink link(ctx0, ctx1);
     std::printf("PpLink over (%d,%d)\n", dev0, dev1);
 
     const std::size_t bytes = 21u << 20;
