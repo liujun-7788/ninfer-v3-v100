@@ -221,15 +221,20 @@ def _encode_fp8_from_bf16(
     rows = spec.shape[0]
     columns = spec.shape[1]
     if device != "cpu" and torch.cuda.is_available():
-        step = 32768
+        # Quantize in chunks on the GPU, but emit ONE row-scale-v1 payload:
+        # [all codes][all scales]. Yielding per-chunk [codes|scales] segments
+        # would interleave the planes and corrupt the object.
+        code_chunks: list[torch.Tensor] = []
+        scale_chunks: list[torch.Tensor] = []
+        step = 8192
         for begin in range(0, rows, step):
             end = min(begin + step, rows)
-            chunk = tensor[begin:end].to(device)
-            codes, scale_words = _quantize_rows_torch(chunk, device)
-            scales = scale_words.view(torch.bfloat16)
-            yield fp8_embedding.encode_fp8_row_scaled(
-                codes, scales, (end - begin, columns)
-            )
+            codes, scale_words = _quantize_rows_torch(tensor[begin:end].to(device), device)
+            code_chunks.append(codes.cpu())
+            scale_chunks.append(scale_words.cpu())
+        codes_all = torch.cat(code_chunks, dim=0)
+        scales_all = torch.cat(scale_chunks, dim=0).view(torch.bfloat16)
+        yield fp8_embedding.encode_fp8_row_scaled(codes_all, scales_all, spec.shape)
         return
     for begin in range(0, rows, 8192):
         end = min(begin + 8192, rows)
@@ -396,14 +401,17 @@ def convert(
                     payload = encode_direct(scalar, inventory.FP32)
                 elif spec.name in recipe.QUANTIZED_DIRECT_BY_NAME:
                     tensor = _materialize_direct(spec, reader)
+                    # Grouped-int quantize on host: the peak grouped tensor
+                    # (draft head Q4) needs ~2.5 GiB that a busy GPU may not
+                    # have, and these tensors are a small share of the run.
                     payload = family_conversion.encode_tensor_payload(
-                        tensor, spec, resolved_device
+                        tensor, spec, "cpu"
                     )
                     del tensor
                 else:
                     tensor = _materialize_official(spec, reader, derived)
                     payload = family_conversion.encode_tensor_payload(
-                        tensor, spec, resolved_device
+                        tensor, spec, "cpu"
                     )
                     del tensor
                 writer.write(spec.name, payload)

@@ -154,6 +154,12 @@ public:
     void zero_slot(std::int32_t slot, cudaStream_t stream = nullptr);
     void zero_all(cudaStream_t stream = nullptr);
     void copy_slot(std::int32_t source, std::int32_t destination, cudaStream_t stream = nullptr);
+
+    // Pipeline mirroring: identical layout on the peer ranks; slot zero/copy operations on
+    // this pool replay into every mirror so GDN conv/recurrent initial states stay in
+    // lockstep across the pipeline (per-rank forward writes are NOT mirrored).
+    void add_mirror(StateImageDevicePool& mirror);
+    [[nodiscard]] std::size_t mirror_count() const noexcept { return mirrors_.size(); }
     void copy_dflash_local(std::int32_t source, std::int32_t destination,
                            cudaStream_t stream = nullptr);
     void copy_to_host(std::int32_t source, HostStateImageView destination,
@@ -165,6 +171,7 @@ private:
     void validate_host_layout(const StateImageHostLayout* layout, const std::byte* data) const;
 
     LinearAttentionStatePool linear_;
+    std::vector<StateImageDevicePool*> mirrors_;
     Tensor continuation_hidden_;
     std::optional<CyclicKVCache> dflash_local_;
     StateImageHostLayout host_layout_;

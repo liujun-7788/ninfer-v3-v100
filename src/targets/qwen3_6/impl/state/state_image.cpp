@@ -318,8 +318,14 @@ const CyclicKVCache* StateImageDevicePool::dflash_local() const noexcept {
     return dflash_local_ ? &*dflash_local_ : nullptr;
 }
 
+void StateImageDevicePool::add_mirror(StateImageDevicePool& mirror) {
+    if (&mirror == this) { throw std::invalid_argument("StateImage mirror wiring is invalid"); }
+    mirrors_.push_back(&mirror);
+}
+
 void StateImageDevicePool::zero_slot(std::int32_t slot, cudaStream_t stream) {
     validate_slot(slot, slot_count(), "StateImage zero slot is out of range");
+    for (StateImageDevicePool* m : mirrors_) { m->zero_slot(slot, stream); }
     linear_.zero_slot(slot, stream);
     const Tensor hidden = continuation_hidden_slot(slot);
     CUDA_CHECK(cudaMemsetAsync(hidden.data, 0, hidden.bytes(), stream));
@@ -335,6 +341,7 @@ void StateImageDevicePool::zero_slot(std::int32_t slot, cudaStream_t stream) {
 }
 
 void StateImageDevicePool::zero_all(cudaStream_t stream) {
+    for (StateImageDevicePool* m : mirrors_) { m->zero_all(stream); }
     linear_.zero_all(stream);
     CUDA_CHECK(cudaMemsetAsync(continuation_hidden_.data, 0, continuation_hidden_.bytes(), stream));
     if (dflash_local_) {
@@ -348,6 +355,7 @@ void StateImageDevicePool::zero_all(cudaStream_t stream) {
 
 void StateImageDevicePool::copy_slot(std::int32_t source, std::int32_t destination,
                                      cudaStream_t stream) {
+    for (StateImageDevicePool* m : mirrors_) { m->copy_slot(source, destination, stream); }
     validate_slot(source, slot_count(), "StateImage copy source is out of range");
     validate_slot(destination, slot_count(), "StateImage copy destination is out of range");
     if (source == destination) { return; }
