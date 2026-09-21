@@ -46,13 +46,7 @@ __global__ void pp_wait_kernel(unsigned long long* counter,
 
 } // namespace
 
-PpLink::PpLink(DeviceContext& rank0, DeviceContext& rank1) {
-    ranks_[0] = &rank0;
-    ranks_[1] = &rank1;
-    if (ranks_[0]->device == ranks_[1]->device) {
-        throw std::invalid_argument("PpLink requires two distinct devices");
-    }
-    enable_peer_access();
+void PpLink::init_mailbox() {
     const cudaError_t err = cudaHostAlloc(&mailbox_, sizeof(Mailbox),
                                           cudaHostAllocMapped | cudaHostAllocPortable);
     if (err != cudaSuccess) {
@@ -71,6 +65,24 @@ PpLink::PpLink(DeviceContext& rank0, DeviceContext& rank1) {
                                    ranks_[r]->stream));
         CUDA_CHECK(cudaStreamSynchronize(ranks_[r]->stream));
     }
+}
+
+PpLink::PpLink(DeviceContext& rank0, DeviceContext& rank1) {
+    ranks_[0] = &rank0;
+    ranks_[1] = &rank1;
+    if (ranks_[0]->device == ranks_[1]->device) {
+        throw std::invalid_argument("PpLink requires two distinct devices");
+    }
+    enable_peer_access();
+    init_mailbox();
+}
+
+PpLink::PpLink(DeviceContext& rank0, int peer_device)
+    : peer_owner_(std::make_unique<DeviceContext>(peer_device)) {
+    ranks_[0] = &rank0;
+    ranks_[1] = peer_owner_.get();
+    enable_peer_access();
+    init_mailbox();
 }
 
 PpLink::~PpLink() {
