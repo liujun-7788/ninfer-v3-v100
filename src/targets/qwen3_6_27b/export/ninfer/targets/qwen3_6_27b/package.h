@@ -133,9 +133,14 @@ struct Package {
     [[nodiscard]] static SequencePlanner make_sequence_planner(DeviceContext& device,
                                                                const EngineOptions& options,
                                                                WeightsProfile weights_profile);
+    struct ProgramPipeline {
+        ninfer::PpLink* pp             = nullptr;
+        const LoadedModel* rank1_model = nullptr;
+    };
     [[nodiscard]] static std::unique_ptr<Program>
     create_program(const LoadedModel& model, SequencePlan&& plan, DeviceContext& device,
-                   const StartupObserver& startup_observer);
+                   const StartupObserver& startup_observer,
+                   const ProgramPipeline& pipeline);
 };
 
 } // namespace targets::qwen3_6_27b
