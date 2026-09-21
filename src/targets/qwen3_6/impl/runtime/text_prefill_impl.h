@@ -35,6 +35,18 @@ DFlashFeatureSink make_dflash_prefill_sink(PrefillContext& state) {
 void configure_text_card(TextContext& card, const ExecutionCore& execution,
                          const ops::SamplingConfig* sampling, std::int32_t state_source_slot,
                          std::int32_t state_destination_slot, std::uint32_t mtp_proposal_extent) {
+    if (execution.pp != nullptr) {
+        card.set_pipeline({execution.layer_begin,
+                           execution.layer_end,
+                           execution.gdn_offset,
+                           execution.attn_offset,
+                           execution.pp,
+                           execution.pp_site,
+                           execution.pp_rank,
+                           execution.peer_hidden,
+                           execution.peer_hidden_bytes,
+                           execution.boundary_local});
+    }
     card.set_sampling(sampling);
     card.set_linear_state_slots(state_source_slot, state_destination_slot);
     card.set_gdn_state_action(GdnStateAction::UpdateInPlace, nullptr);

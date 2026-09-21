@@ -1106,6 +1106,14 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
             throw std::invalid_argument("Qwen3.6 pipeline seed requires a rank-1 model view");
         }
         pp_split = static_cast<std::uint32_t>(TextConfig::layers) / 2U;
+        for (std::uint32_t l = 0; l < pp_split; ++l) {
+            if (l >= 3 && (l - 3) % 4 == 0) { ++pp_attn_count; }
+        }
+        if (speculative_backend != SpeculativeBackend::None) {
+            throw std::invalid_argument(
+                "Qwen3.6 pipeline V1 requires speculative decoding to be disabled");
+        }
+        pp_link->arm_zero_wait(0, kPpSiteAck);
         peer.synchronize();
         device_in.synchronize();
     }
@@ -1225,6 +1233,9 @@ std::vector<float> ProgramImplCore::causal_score(PreparedPromptData&& prompt,
                 state_slot,
                 0,
                 nullptr};
+            if (pp_link != nullptr) {
+                throw std::logic_error("causal scoring is not supported in pipeline mode");
+            }
             mark_workspace_usage(workspace_plan.text_prefill);
             const schedule::PrefillChunkResult result = schedule::prefill_text_chunk(
                 schedule_state, std::span<const TokenId>(prompt.token_ids), nominal, std::nullopt,
@@ -11021,6 +11032,69 @@ qwen3_6::PagedKVCacheView ProgramImplCore::text_kv_view(const SequenceState& seq
     return decoder->text_kv.execution_view(text_kv_addresses->execution_row(sequence.kv->text));
 }
 
+qwen3_6::PagedKVCacheView ProgramImplCore::text_kv_view1(const SequenceState& sequence) const {
+    if (!rank1 || !sequence.kv) {
+        throw std::logic_error("sequence has no active KV execution mapping");
+    }
+    return rank1->decoder->text_kv.execution_view(
+        text_kv_addresses->execution_row(sequence.kv->text));
+}
+
+qwen3_6::PagedKVCacheView ProgramImplCore::mtp_kv_view1(const SequenceState& sequence) const {
+    if (speculative_backend != SpeculativeBackend::Mtp) { return {}; }
+    if (rank1->decoder->mtp_cache() == nullptr || !sequence.kv || !sequence.kv->backend ||
+        !backend_kv_addresses->active(*sequence.kv->backend)) {
+        throw std::logic_error("sequence has no active MTP KV execution mapping");
+    }
+    return rank1->decoder->mtp_cache()->execution_view(
+        backend_kv_addresses->execution_row(*sequence.kv->backend));
+}
+
+schedule::ExecutionCore ProgramImplCore::rank_core(std::size_t rank, const GdnReplayRecords* records,
+                                                   std::size_t hidden_site) {
+    if (rank == 0) {
+        return schedule::ExecutionCore{device,
+                                       model,
+                                       work,
+                                       state_images->linear(),
+                                       records,
+                                       io,
+                                       prefill_hidden,
+                                       prefill_chunk,
+                                       proposal_head,
+                                       0,
+                                       pp_split,
+                                       0,
+                                       0,
+                                       pp_link,
+                                       hidden_site,
+                                       0,
+                                       rank1.has_value() ? rank1->boundary.data : nullptr,
+                                       0,
+                                       nullptr};
+    }
+    if (!rank1) { throw std::logic_error("pipeline rank-1 state is missing"); }
+    return schedule::ExecutionCore{pp_link->rank(1),
+                                   *rank1->model,
+                                   *rank1->work,
+                                   rank1->state_images->linear(),
+                                   records,
+                                   *rank1->io,
+                                   rank1->prefill_hidden,
+                                   prefill_chunk,
+                                   proposal_head,
+                                   pp_split,
+                                   static_cast<std::uint32_t>(TextConfig::layers),
+                                   pp_split - static_cast<std::uint32_t>(pp_attn_count),
+                                   static_cast<std::uint32_t>(pp_attn_count),
+                                   pp_link,
+                                   hidden_site,
+                                   1,
+                                   nullptr,
+                                   0,
+                                   rank1->boundary.data};
+}
+
 qwen3_6::PagedKVCacheView ProgramImplCore::mtp_kv_view(const SequenceState& sequence) const {
     if (speculative_backend != SpeculativeBackend::Mtp) { return {}; }
     if (decoder->mtp_cache() == nullptr || !sequence.kv || !sequence.kv->backend ||
@@ -11628,9 +11702,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
             rewrite_capture_hidden_ptr = &rewrite_capture_hidden;
         }
         schedule::PrefillContext schedule_state{
-            {device, model, work, state_images->linear(),
-             replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head},
+            {rank_core(0, replay_records ? &*replay_records : nullptr, kPpSitePrefill)},
             text_kv_view(sequence),
             mtp_kv_view(sequence),
             decoder->text_kv,
@@ -11644,8 +11716,30 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
             selectors.destination,
             staged.initial_mtp_extent,
             dflash_host_ingress};
+        std::optional<schedule::PrefillContext> schedule_state1;
+        if (pp_link != nullptr) {
+            schedule_state1.emplace(
+                schedule::PrefillContext{
+                    {rank_core(1, nullptr, kPpSitePrefill)},
+                    text_kv_view1(sequence),
+                    mtp_kv_view1(sequence),
+                    rank1->decoder->text_kv,
+                    rank1->decoder->mtp_cache(),
+                    nullptr,
+                    staged.cursor,
+                    static_cast<const ops::SamplingConfig*>(
+                        sampling_config.slice(1, static_cast<std::int32_t>(sequence.lane), 1).data),
+                    nullptr,
+                    selectors.source,
+                    selectors.destination,
+                    staged.initial_mtp_extent,
+                    nullptr});
+        }
 
         if (staged.mtp_bridge == MtpBridgeMode::BeforeSuffix) {
+            if (pp_link != nullptr) {
+                throw std::logic_error("MTP bridge is not supported in pipeline V1");
+            }
             if (staged.cursor != staged.base || staged.base == 0 ||
                 staged.cursor >= staged.prompt_tokens) {
                 throw std::logic_error("staged MTP bridge is outside the reusable suffix");
@@ -11722,9 +11816,20 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                                                                 *staged.vision, remaining,
                                                                 split_frontier, final_candidate);
                 } else {
+                    if (pp_link != nullptr) { pp_link->wait(0, kPpSiteAck); }
                     result = schedule::prefill_text_chunk(
                         schedule_state, std::span<const TokenId>(staged.prompt.token_ids),
                         remaining, split_frontier, final_candidate);
+                    if (pp_link != nullptr) {
+                        schedule_state1->text_kv_base           = schedule_state.text_kv_base;
+                        schedule_state1->state_source_slot      = schedule_state.state_source_slot;
+                        schedule_state1->state_destination_slot =
+                            schedule_state.state_destination_slot;
+                        schedule::prefill_text_chunk(
+                            *schedule_state1, std::span<const TokenId>(staged.prompt.token_ids),
+                            remaining, split_frontier, final_candidate);
+                        pp_link->signal(1, kPpSiteAck);
+                    }
                 }
                 timing.include(result.timing);
                 timing.resume_post();
@@ -11952,10 +12057,7 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             ensure_sequence_kv_mapped(sequence, frontier + 1, 0);
         }
 
-        schedule::OrdinaryBatchContext schedule_state{{device, model, work, state_images->linear(),
-                                                       replay_records ? &*replay_records : nullptr,
-                                                       io, prefill_hidden, prefill_chunk,
-                                                       proposal_head},
+        schedule::OrdinaryBatchContext schedule_state{{rank_core(0, nullptr, kPpSiteVerify)},
                                                       decoder->text_kv,
                                                       *io.ordinary,
                                                       *ordinary_host_ingress,
@@ -11963,8 +12065,21 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
                                                       state_images->continuation_hidden_store()};
 
         mark_workspace_usage(workspace_plan.ordinary_round);
+        if (pp_link != nullptr) { pp_link->wait(0, kPpSiteAck); }
         schedule::ordinary_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                         envelope, executable);
+        if (pp_link != nullptr) {
+            schedule::OrdinaryBatchContext schedule_state1{
+                {rank_core(1, nullptr, kPpSiteVerify)},
+                rank1->decoder->text_kv,
+                *rank1->io->ordinary,
+                *ordinary_host_ingress,
+                *ordinary_host_egress,
+                rank1->state_images->continuation_hidden_store()};
+            schedule::ordinary_decode_batch(schedule_state1, static_cast<std::int32_t>(lanes.size()),
+                                            envelope, nullptr);
+            pp_link->signal(1, kPpSiteAck);
+        }
         submit_range.reset();
         timing.begin_wait();
         {
