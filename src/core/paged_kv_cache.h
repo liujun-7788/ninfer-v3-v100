@@ -368,6 +368,9 @@ public:
                           cudaStream_t stream = nullptr);
 
     [[nodiscard]] Tensor row(KVExecutionRowHandle handle) const;
+    // Pipeline mirror access: same layout/row index on the mirror pool, no lease validation
+    // (rows are owned by the primary pool only).
+    [[nodiscard]] Tensor row_unchecked(std::int32_t row_index) const;
 
     [[nodiscard]] const Tensor& matrix() const noexcept { return block_tables_; }
 

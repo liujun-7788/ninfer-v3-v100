@@ -70,6 +70,10 @@ public:
 
     [[nodiscard]] DeviceKVPagePool& page_pool() noexcept { return pages_; }
 
+    // Pipeline mirror access: build a view over this cache with the mirror pool's table row
+    // (same row index and mirrored content), bypassing primary-pool lease validation.
+    [[nodiscard]] PagedKVCacheView execution_view_unchecked(std::int32_t row_index) const;
+
     [[nodiscard]] const DeviceKVPagePool& page_pool() const noexcept { return pages_; }
 
     [[nodiscard]] KVExecutionTablePool& execution_tables() noexcept { return execution_tables_; }

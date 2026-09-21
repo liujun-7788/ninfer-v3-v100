@@ -559,18 +559,31 @@ void DeviceKVPagePool::mirror_take_pages(std::int32_t begin, std::uint32_t count
     }
     const std::size_t position = static_cast<std::size_t>(begin);
     if (page_allocated_[position]) { throw std::logic_error("Paged KV mirror page is busy"); }
-    const auto run = std::lower_bound(
+    const auto hint = std::lower_bound(
         free_page_runs_.begin(), free_page_runs_.end(), begin,
         [](const FreePageRun& candidate, std::int32_t page) { return candidate.begin < page; });
-    if (run == free_page_runs_.begin() || (run - 1)->begin > begin ||
-        static_cast<std::uint64_t>((run - 1)->begin) + (run - 1)->count <
-            static_cast<std::uint64_t>(begin) + count) {
+    FreePageRun* run = nullptr;
+    std::size_t run_index = 0;
+    if (hint != free_page_runs_.end() && hint->begin == begin &&
+        hint->count >= count) {
+        run       = &*hint;
+        run_index = static_cast<std::size_t>(hint - free_page_runs_.begin());
+    } else if (hint != free_page_runs_.begin()) {
+        auto* prev = &*(hint - 1);
+        if (prev->begin <= begin &&
+            static_cast<std::uint64_t>(prev->begin) + prev->count >=
+                static_cast<std::uint64_t>(begin) + count) {
+            run       = prev;
+            run_index = static_cast<std::size_t>(hint - 1 - free_page_runs_.begin());
+        }
+    }
+    if (run == nullptr) {
         throw std::logic_error("Paged KV mirror allocation has no matching free run");
     }
     for (std::uint32_t offset = 0; offset < count; ++offset) {
         page_allocated_[static_cast<std::size_t>(begin) + offset] = true;
     }
-    consume_free_run(static_cast<std::size_t>(run - 1 - free_page_runs_.begin()), begin, count);
+    consume_free_run(run_index, begin, count);
     allocated_pages_ += count;
 }
 
@@ -925,6 +938,14 @@ void KVExecutionTablePool::publish_indices(KVExecutionRowHandle row_handle,
         CUDA_CHECK(cudaMemcpyAsync(mirror_destination, indices.data(), indices.size_bytes(),
                                    cudaMemcpyHostToDevice, stream));
     }
+}
+
+Tensor KVExecutionTablePool::row_unchecked(std::int32_t row_index) const {
+    if (row_index < 0 || row_index >= row_count()) {
+        throw std::out_of_range("Paged KV execution row is out of range");
+    }
+    return block_tables_.slice(1, row_index, 1)
+        .view({static_cast<std::int32_t>(logical_page_capacity())});
 }
 
 Tensor KVExecutionTablePool::row(KVExecutionRowHandle handle) const {

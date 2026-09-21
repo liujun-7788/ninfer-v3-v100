@@ -94,6 +94,10 @@ PagedKVLayerView PagedKVCacheView::layer_view(std::uint32_t layer) const {
     return cache_->layer_view(layer, block_table_);
 }
 
+PagedKVCacheView PagedKVCache::execution_view_unchecked(std::int32_t row_index) const {
+    return PagedKVCacheView(*this, execution_tables_.row_unchecked(row_index));
+}
+
 PagedKVCacheView PagedKVCache::execution_view(const KVExecutionRowLease& row) const {
     if (!row.belongs_to(execution_tables_)) {
         throw std::invalid_argument("Paged KV execution row belongs to another cache");
