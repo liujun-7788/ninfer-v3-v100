@@ -181,4 +181,15 @@ void PpLink::arm_zero_wait(std::size_t consumer, std::size_t site) {
                           cudaMemcpyHostToDevice));
 }
 
+void PpLink::signal(std::size_t rank, std::size_t site) {
+    if (rank >= kRankCount || site >= kPpMaxSites) {
+        throw std::out_of_range("PpLink signal index");
+    }
+    DeviceContext& ctx = ranks_[rank];
+    ctx.bind_to_current_thread();
+    pp_signal_kernel<<<1, 32, 0, ctx.stream>>>(counters_[rank] + site,
+                                               mailbox_->flag[rank] + site);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace ninfer

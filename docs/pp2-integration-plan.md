@@ -1,8 +1,65 @@
 # PP2 双卡层流水线改造 — 实施计划（2026-09-21）
 
-状态：通信基建已完成并验证（commit b6d022f8 TpGroup、de05f850 PpLink）。
-本文是下一阶段的精确实施清单。工作目录 `/data/deploy/ninfer-mp`（mp-dev 分支），
-本地镜像 `C:\Users\liujun\ninfer-mp-src`。
+状态更新（同日晚）：
+- ✅ 步骤 1（镜像池）完成并编译通过：commit 228bcbac。DeviceKVPagePool.set_mirror +
+  mirror_take_pages/mirror_release_page（raw 索引路径，绕过 owner/代数校验），
+  materialize/materialize_one/release_page 自动镜像；zero_pages/copy_page 按
+  contiguous run 同时写主/镜像池平面；KVExecutionTablePool.set_mirror + publish_indices
+  直写镜像矩阵。copy_to_host/from_host 故意不镜像（PP 模式禁用 host offload）。
+- ✅ 步骤 2（ExecutionCore）+ 步骤 3（TextContext 层分段）完成：commit 0c1cb00c。
+  ExecutionCore 新增 layer_begin/layer_end/gdn_offset/attn_offset/pp/pp_site/pp_rank/
+  peer_hidden/peer_hidden_bytes（默认全零=单卡完整行为，所有旧调用点零改动）。
+  TextContext::set_pipeline(Pipeline)；run_layers 入口 wait+boundary DtoD copy、
+  出口 push；attn/gdn/replay 的索引平移；next_projection_hints 按 rank 边界截断；
+  ordinary_decode_batch / target_verify_batch_impl / prefill_impl 的 stem（embedding）
+  与 tail（rmsnorm/lm_head/sample/MTP-prep）按 first/last 门控。
+- 全量构建 0 error，apps/ninfer-serve 正常产出。
+- 提交链：b6d022f8 → de05f850 → c54186d9 → 228bcbac → 0c1cb00c。
+
+## 剩余工作（步骤 4-7 的精确落点）
+
+### 步骤 4：ProgramImplCore 双 rank 化（program_impl.h）
+已确认的关键锚点：
+- `execution_core` lambda 在 ~11182 行（warmup 图捕获区），构造 ExecutionCore 的唯一工厂；
+  另有两处内联构造（11567 附近 prefill、11892/12091 附近 decode_raw/mtp_raw）。
+- 池构造在构造函数 826-960 区域（logical_page_capacity lambda、host kv、backend cache）。
+- `backend_kv_cache()` 10776、`text_kv_view/mtp_kv_view` 10954。
+改造内容：
+1. PpLink 实例（拥有两个 DeviceContext；原 `device` 成员绑 rank0）。
+2. `RankBundle`：{DeviceContext*, LoadedModelData*, WorkspaceArena*, LinearAttentionStatePool*,
+   RoundState*(io1), Tensor* prefill_hidden1, PagedKVCache*(rank1 cache), 图族副本,
+   ordinary/mtp host 缓冲副本, boundary Tensor(21MB cudaMalloc, 启动固定)}。
+3. rank0 的 KV 池为主、rank1 为 mirror（set_mirror 互指：主池→镜像池单向即可，
+   镜像操作全部由主池发起）；几何按各自 32 层减半；表池同构镜像。
+4. 图捕获：per-rank 调 capture_*（每 rank 一个 OrdinaryBatchContext/MtpBatchContext）。
+   解码轮次闸门：rank1 图尾 ack-signal(site_ack)，rank0 图首 ack-wait，
+   `arm_zero_wait(0, site_ack)` 初始化 -1（首轮直通）。PpLink 需补一个
+   `signal(consumer→producer 反向)` 便捷接口（现 push 是单向拷贝+signal，
+   ack 只需 signal 不拷贝——给 PpLink 加 `signal_only(rank, site)`）。
+5. decode_raw / advance_prefill_raw / mtp 路径：上下文按 rank 构造、schedule 函数
+   每 rank 调一次；采样/egress 只读 rank1。
+6. prefill 流水：enqueue 顺序 A(i)@rank0 → B(i)@rank1（B 内部 wait），除 finalize 外
+   主机不同步。跨 chunk 安全性已论证（KV 区间不相交、workspace 各 rank 独立、
+   boundary 地址启动固定）。
+7. V1 约束：--pp-devices 与 host-offload/context-cache/vision 互斥（启动时报错），
+   max-concurrency 不变（引擎逻辑不动，PP 只影响 Program 内部）。
+
+### 步骤 5：加载分段（bindings.cpp / package.cpp）
+- LoadedModel 数组尺寸不变（编译期 16/48）；rank 只 materialize 自己层范围的张量，
+  其余层留 null view。embedding/vision → rank0；final_norm/output_head/MTP/proposal → rank1。
+- 在 package 构造处按 rank 切两次 device 上下文各加载一遍 artifact。
+
+### 步骤 6：CLI
+- serve_options/parse：`--pp-devices A,B`；engine.cpp：initialize_device 分支；
+  registry/construct_target 传递设备对。
+
+### 步骤 7：验证（用户已授权随时停 7004/7005/7006，测完恢复）
+a. 单卡回归：`--device 1` 起 7005 同配置，冒烟对话。
+b. PP2 正确性：`--pp-devices 3,4` 同 prompt 贪心解码 vs 单卡逐 token 比对。
+c. 基准：并发 1，1k/8k/32k/131k，对比 1catvllm 表格指标（TTFT/预填充/输出速度）。
+   测前停 7004（占 GPU3/4）+ 7005/7006（GPU1/2 可做单卡对照组），测完恢复。
+
+## 风险与备注
 
 ## 背景与决策
 
