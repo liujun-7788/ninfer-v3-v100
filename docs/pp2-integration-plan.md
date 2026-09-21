@@ -22,7 +22,15 @@
 已确认的关键锚点：
 - `execution_core` lambda 在 ~11182 行（warmup 图捕获区），构造 ExecutionCore 的唯一工厂；
   另有两处内联构造（11567 附近 prefill、11892/12091 附近 decode_raw/mtp_raw）。
-- 池构造在构造函数 826-960 区域（logical_page_capacity lambda、host kv、backend cache）。
+- 物理存储构造在构造函数 833-960：`decoder = make_unique<DecoderState>(backing, plan.persistent.decoder)`
+  → `text_kv`（PagedKVCache）、`state_images`（StateImageDevicePool）、replay records 等，
+  全部从**同一布局计划**绑定到 backing DeviceSpan。
+- **rank1 实例化模式（本轮定稿）**：rank1 的 DecoderState/StateImageDevicePool/replay
+  records/work 各自在 rank1 设备上 cudaMalloc 一块同尺寸 backing，用**同一个 plan 子布局**
+  再构造一份（布局计划单拷贝，物理双份）；rank1 的 KV 池/表池与 rank0 的 set_mirror 互连。
+  PagedKVCacheView 是 (cache指针, block_table张量) 绑定 —— 每 rank 用自己的 cache 构建
+  视图，页号经镜像天然一致，表内容经 publish 镜像天然一致。
+- weights：rank1 的 LoadedModelData 由加载路径第二遍产出（见步骤 5）。
 - `backend_kv_cache()` 10776、`text_kv_view/mtp_kv_view` 10954。
 改造内容：
 1. PpLink 实例（拥有两个 DeviceContext；原 `device` 成员绑 rank0）。
