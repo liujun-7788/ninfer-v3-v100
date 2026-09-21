@@ -23,6 +23,12 @@
 #include <optional>
 #include <span>
 
+namespace ninfer {
+
+class PpLink;
+
+} // namespace ninfer
+
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
 
 using qwen3_6::PreparedPromptData;
@@ -38,6 +44,25 @@ struct ExecutionCore {
     Tensor& prefill_hidden;
     std::uint32_t prefill_chunk;
     ProposalHead proposal_head;
+
+    // Pipeline split (single-GPU builds use the defaults: full range, no link). Layers
+    // outside [layer_begin, layer_end) belong to other ranks; their weights stay unbound.
+    // gdn_offset/attn_offset translate model-wide layer indexes into this rank's local
+    // state-pool and KV-cache-view indexes. peer_hidden is the consumer-side boundary
+    // buffer address on the peer device (host-known per unit; stable across captures).
+    std::uint32_t layer_begin      = 0;
+    std::uint32_t layer_end        = 0;
+    std::uint32_t gdn_offset       = 0;
+    std::uint32_t attn_offset      = 0;
+    PpLink* pp                     = nullptr;
+    std::size_t pp_site            = 0;
+    std::size_t pp_rank            = 0;
+    void* peer_hidden              = nullptr;
+    std::size_t peer_hidden_bytes  = 0;
+
+    [[nodiscard]] bool pipeline_first() const noexcept { return layer_begin == 0; }
+    // layer_end == 0 means "unset" = full range (existing aggregate-init call sites).
+    [[nodiscard]] bool pipeline_last() const noexcept { return layer_end == 0; }
 };
 
 struct PrefillContext {

@@ -3,6 +3,7 @@
 #include "targets/qwen3_6/impl/runtime/workspace_recipe.h"
 
 #include "core/nvtx.h"
+#include "core/pp_link.h"
 #include "targets/qwen3_6/impl/runtime/visual_scatter.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include <ninfer/targets/qwen3_6/vision_control.h>
@@ -43,6 +44,9 @@
 #include <vector>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
+
+void TextContext::set_pipeline(const Pipeline& pipeline) { pipeline_ = pipeline; }
+
 namespace {
 
 void copy_i32(const std::int32_t* source, Tensor& destination, cudaStream_t stream) {
@@ -679,12 +683,17 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
         ScopedValue<std::int32_t> batch_binding(active_sequence_batch_, batch);
         ScopedValue<std::int32_t> width_binding(active_sequence_width_, 1);
 
+        const bool pp_first = pipeline_.layer_begin == 0;
+        const bool pp_last  = pipeline_.layer_end == 0 ||
+                             pipeline_.layer_end >= static_cast<std::uint32_t>(kCfg.n_layers);
         Tensor x = work_.alloc(DType::BF16, {kCfg.hidden, batch});
-        ops::embedding(ids, *embed_, x, stream);
+        if (pp_first) { ops::embedding(ids, *embed_, x, stream); }
         NullTap tap;
         run_layers(x, Phase::Verify, tap);
-        ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, hidden, stream);
-        ops::linear(hidden, *lm_head_, logits, stream);
+        if (pp_last) {
+            ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, hidden, stream);
+            ops::linear(hidden, *lm_head_, logits, stream);
+        }
     }
     work_.reset();
 }
@@ -732,9 +741,12 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
         ScopedValue<std::int32_t> batch_binding(active_sequence_batch_, batch);
         ScopedValue<std::int32_t> width_binding(active_sequence_width_, width);
 
+        const bool pp_first = pipeline_.layer_begin == 0;
+        const bool pp_last  = pipeline_.layer_end == 0 ||
+                             pipeline_.layer_end >= static_cast<std::uint32_t>(kCfg.n_layers);
         Tensor x        = work_.alloc(DType::BF16, {kCfg.hidden, columns});
         Tensor flat_ids = ids.view({columns});
-        ops::embedding(flat_ids, *embed_, x, stream);
+        if (pp_first) { ops::embedding(flat_ids, *embed_, x, stream); }
         if constexpr (Tap::enabled) { tap.begin(x); }
         run_layers(x, Phase::Verify, tap);
         if constexpr (requires { tap.capture_positions(cache_positions, stream); }) {
@@ -743,9 +755,11 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
         Tensor flat_hidden = hidden.view({kCfg.hidden, columns});
         Tensor flat_logits = logits.view({kCfg.vocab, columns});
         Tensor flat_tokens = target_tokens.view({columns});
-        ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, flat_hidden, stream);
-        ops::linear(flat_hidden, *lm_head_, flat_logits, stream);
-        ops::argmax(flat_logits, flat_tokens, kCfg.token_domain, stream);
+        if (pp_last) {
+            ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, flat_hidden, stream);
+            ops::linear(flat_hidden, *lm_head_, flat_logits, stream);
+            ops::argmax(flat_logits, flat_tokens, kCfg.token_domain, stream);
+        }
     }
     work_.reset();
 }
@@ -865,12 +879,12 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
         ops::causal_softmax_attention(q_batch, k_batch, v_batch, position_batch, valid,
                                       kv_table_rows, {kCfg.head_dim, kCfg.n_q, kCfg.n_kv},
-                                      kAttnScale, batch_text_kv_->batch_layer_view(fidx),
+                                      kAttnScale, batch_text_kv_->batch_layer_view(fidx - static_cast<int>(pipeline_.attn_offset)),
                                       *active_causal_attention_envelope_, work_, a_batch, s);
     } else {
         ops::causal_softmax_attention(qn, kn, v, cache_positions, Tensor{}, kv_table_rows,
                                       {kCfg.head_dim, kCfg.n_q, kCfg.n_kv}, kAttnScale,
-                                      batch_text_kv_->batch_layer_view(fidx),
+                                      batch_text_kv_->batch_layer_view(fidx - static_cast<int>(pipeline_.attn_offset)),
                                       *active_causal_attention_envelope_, work_, a, s);
     }
     ops::sigmoid_mul(gate, a, s);
@@ -911,13 +925,15 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
         Tensor key_output       = kc.view({kCfg.key_dim, width, active_sequence_batch_});
         Tensor value_output     = vc.view({kCfg.value_dim, width, active_sequence_batch_});
         Tensor gate_output      = z.view({kCfg.value_dim, width, active_sequence_batch_});
-        Tensor conv_states      = state_.layer_view(static_cast<std::uint32_t>(gidx)).conv;
+        Tensor conv_states =
+            state_.layer_view(static_cast<std::uint32_t>(gidx) - pipeline_.gdn_offset).conv;
         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
         if (gdn_state_action_ == GdnStateAction::RecordForReplay) {
             if (replay_records_ == nullptr) {
                 throw std::logic_error("Replay-record GDN has no record storage");
             }
-            GdnReplayRecordLayer records = replay_records_->layer(gidx, active_sequence_batch_);
+            GdnReplayRecordLayer records =
+            replay_records_->layer(gidx - static_cast<int>(pipeline_.gdn_offset), active_sequence_batch_);
             Variant::gdn_input_projection_record(
                 projection_input, *w.projection, *w.conv1d, conv_states, valid,
                 *active_linear_state_source_slots_, records.conv, query_output, key_output,
@@ -932,9 +948,9 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
         Tensor qkv = workspace_recipe::gdn_prefill_conv<TextConfig>(work_, T);
         Variant::gdn_input_projection(h, *w.projection, qkv, z, ph, work_, s);
         Tensor conv_state_in =
-            state_.conv_slot(static_cast<std::uint32_t>(gidx), linear_state_source_slot_);
+            state_.conv_slot(static_cast<std::uint32_t>(gidx) - pipeline_.gdn_offset, linear_state_source_slot_);
         Tensor conv_state_out =
-            state_.conv_slot(static_cast<std::uint32_t>(gidx), linear_state_destination_slot_);
+            state_.conv_slot(static_cast<std::uint32_t>(gidx) - pipeline_.gdn_offset, linear_state_destination_slot_);
         ops::causal_conv1d_silu_split(qkv, *w.conv1d, conv_state_in, conv_state_out, qc, kc, vc, s);
     }
 
@@ -945,7 +961,8 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     Tensor o  = workspace_recipe::gdn_recurrent_output<TextConfig>(work_, T).view(
         {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
     if (ph == Phase::Verify) {
-        Tensor recurrent_states  = state_.layer_view(static_cast<std::uint32_t>(gidx)).recurrent;
+        Tensor recurrent_states =
+            state_.layer_view(static_cast<std::uint32_t>(gidx) - pipeline_.gdn_offset).recurrent;
         const std::int32_t width = active_sequence_width_;
         Tensor q_batch =
             q_recurrent.view({kCfg.gdn_k_dim, kCfg.gdn_k_heads, width, active_sequence_batch_});
@@ -958,7 +975,8 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
             o.view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, width, active_sequence_batch_});
         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
         if (gdn_state_action_ == GdnStateAction::RecordForReplay) {
-            GdnReplayRecordLayer records = replay_records_->layer(gidx, active_sequence_batch_);
+            GdnReplayRecordLayer records =
+            replay_records_->layer(gidx - static_cast<int>(pipeline_.gdn_offset), active_sequence_batch_);
             ops::gated_delta_net_replay_record(q_batch, k_batch, v_batch, g_batch, beta_batch,
                                                kGdnScale, recurrent_states, valid,
                                                *active_linear_state_source_slots_, records.key,
@@ -971,9 +989,9 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
         }
     } else {
         Tensor recurrent_state_in =
-            state_.recurrent_slot(static_cast<std::uint32_t>(gidx), linear_state_source_slot_);
+            state_.recurrent_slot(static_cast<std::uint32_t>(gidx) - pipeline_.gdn_offset, linear_state_source_slot_);
         Tensor recurrent_state_out =
-            state_.recurrent_slot(static_cast<std::uint32_t>(gidx), linear_state_destination_slot_);
+            state_.recurrent_slot(static_cast<std::uint32_t>(gidx) - pipeline_.gdn_offset, linear_state_destination_slot_);
         ops::gated_delta_net(q_recurrent, k_recurrent, vv, g, beta, kGdnScale,
                              /*normalize_qk=*/true, work_, recurrent_state_in, recurrent_state_out,
                              o, s);
@@ -990,7 +1008,9 @@ ops::SparseMoeHints TextContext::next_projection_hints(int layer) const {
     // Name the next layer's projection codes so this layer's MoE D4 epilogue can warm L2 for
     // them. The last layer names nothing. A pure hint: the value never reaches arithmetic.
     const int next = layer + 1;
-    if (next >= kCfg.n_layers) { return {}; }
+    const int last =
+        pipeline_.layer_end == 0 ? kCfg.n_layers : static_cast<int>(pipeline_.layer_end);
+    if (next >= last) { return {}; }
     if (ModelConfig::is_full(next)) {
         return Variant::projection_prefetch_hints(
             *full_.at(static_cast<std::size_t>(ModelConfig::full_idx(next))).projection);
@@ -1012,7 +1032,19 @@ void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Ph
 template <class Tap>
 void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
     const bool prefill = ph == Phase::Prefill;
-    for (int layer = 0; layer < kCfg.n_layers; ++layer) {
+    const std::uint32_t pp_begin = pipeline_.layer_begin;
+    const std::uint32_t pp_end   = pipeline_.layer_end == 0
+                                       ? static_cast<std::uint32_t>(kCfg.n_layers)
+                                       : pipeline_.layer_end;
+    if (pp_begin != 0) {
+        if (pipeline_.pp != nullptr) {
+            pipeline_.pp->wait(pipeline_.pp_rank, pipeline_.pp_site);
+        }
+        CUDA_CHECK(cudaMemcpyAsync(x.data, pipeline_.boundary_local,
+                                   x.numel() * sizeof(std::uint16_t), cudaMemcpyDeviceToDevice,
+                                   ctx_.stream));
+    }
+    for (std::uint32_t layer = pp_begin; layer < pp_end; ++layer) {
         if (ModelConfig::is_full(layer)) {
             const int fidx         = ModelConfig::full_idx(layer);
             const FullLayerW& full = full_.at(static_cast<std::size_t>(fidx));
@@ -1056,6 +1088,10 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                 if constexpr (Tap::enabled) { tap.capture_layer(layer, x, ctx_.stream); }
             }
         }
+    }
+    if (pp_end < static_cast<std::uint32_t>(kCfg.n_layers) && pipeline_.pp != nullptr) {
+        pipeline_.pp->push(pipeline_.pp_rank, x.data, pipeline_.peer_hidden,
+                           x.numel() * sizeof(std::uint16_t), pipeline_.pp_site);
     }
 }
 
@@ -1187,9 +1223,14 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             const ops::CausalAttentionExecutionEnvelope chunk_envelope{visible, visible};
             ScopedEnvelope scoped_envelope(active_causal_attention_envelope_, chunk_envelope);
 
+            const bool pp_first = pipeline_.layer_begin == 0;
+            const bool pp_last  = pipeline_.layer_end == 0 ||
+                                 pipeline_.layer_end >= static_cast<std::uint32_t>(kCfg.n_layers);
             Tensor x = roots.residual;
-            ops::embedding(ids_device, *embed_, x, s);
-            if (!local_scatter_indices.empty()) {
+            if (pp_first) {
+                ops::embedding(ids_device, *embed_, x, s);
+            }
+            if (pp_first && !local_scatter_indices.empty()) {
                 Tensor indices_device = roots.scatter_indices;
                 copy_i32(local_scatter_indices.data(), indices_device, s);
                 Tensor embeddings = vision_chunk.embeddings.slice(
@@ -1205,9 +1246,11 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             Tensor xf = prefill_hidden_.data != nullptr
                             ? matrix_window(prefill_hidden_, len)
                             : work_.alloc(DType::BF16, {kCfg.hidden, len});
-            ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, xf, s);
+            if (pp_last) {
+                ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, xf, s);
+            }
 
-            if (is_last) {
+            if (is_last && pp_last) {
                 Tensor last_xf = xf.slice(1, len - 1, 1);
                 Tensor logits  = matrix_window(io_.logits, 1);
                 ops::linear(last_xf, *lm_head_, logits, s);
@@ -1224,7 +1267,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 }
             }
 
-            if (prepare_mtp_prompt) {
+            if (prepare_mtp_prompt && pp_last) {
                 const std::uint32_t alignment_tokens =
                     multimodal != nullptr ? static_cast<std::uint32_t>(multimodal->token_ids.size())
                     : text_prefill != nullptr

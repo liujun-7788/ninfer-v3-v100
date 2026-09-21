@@ -22,6 +22,12 @@
 #include <span>
 #include <vector>
 
+namespace ninfer {
+
+class PpLink;
+
+} // namespace ninfer
+
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
 
 // Target-private compatibility vocabulary for the mechanically preserved fixed schedule. It is
@@ -185,6 +191,25 @@ public:
     void set_linear_state_slots(std::int32_t source_slot, std::int32_t destination_slot);
     void set_gdn_state_action(GdnStateAction action, const GdnReplayRecords* replay_records);
 
+    // Pipeline split (see ExecutionCore). layer_end == 0 means the full range. When set,
+    // run_layers runs only this rank's layers and exchanges the boundary hidden through the
+    // link; state-pool and KV-view indexes are translated by the offsets.
+    struct Pipeline {
+        std::uint32_t layer_begin     = 0;
+        std::uint32_t layer_end       = 0;
+        std::uint32_t gdn_offset      = 0;
+        std::uint32_t attn_offset     = 0;
+        ninfer::PpLink* pp            = nullptr;
+        std::size_t pp_site           = 0;
+        std::size_t pp_rank           = 0;
+        void* peer_hidden             = nullptr;
+        std::size_t peer_hidden_bytes = 0;
+        // This rank's boundary staging buffer (consumer-side landing zone for the incoming
+        // hidden state). Startup-fixed so graph captures stay valid.
+        void* boundary_local          = nullptr;
+    };
+    void set_pipeline(const Pipeline& pipeline);
+
     [[nodiscard]] const Weight* proposal_head() const noexcept { return proposal_head_; }
 
     [[nodiscard]] const std::int32_t* proposal_head_ids() const noexcept {
@@ -322,6 +347,7 @@ private:
     std::int32_t linear_state_destination_slot_                                    = 0;
     GdnStateAction gdn_state_action_          = GdnStateAction::UpdateInPlace;
     const GdnReplayRecords* replay_records_   = nullptr;
+    Pipeline pipeline_{};
     std::int64_t prefill_split_frontier_      = -1;
     Tensor* rewrite_checkpoint_hidden_output_ = nullptr;
     std::uint32_t mtp_proposal_extent_        = 0;
