@@ -80,9 +80,6 @@ void validate_options(const EngineOptions& options) {
         if (options.enable_vision) {
             throw std::invalid_argument("Engine pipeline mode does not support Vision yet");
         }
-        if (options.use_cuda_graph) {
-            throw std::invalid_argument("Engine pipeline mode requires use_cuda_graph=false");
-        }
         if (options.context_cache.host_state_slots != 0 ||
             options.context_cache.host_kv_capacity_bytes != 0) {
             throw std::invalid_argument(
@@ -156,13 +153,8 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     std::unique_ptr<PpLink> pipeline;
     std::vector<std::unique_ptr<typename Target::LoadedModel>> stage_models;
     if (!options.pp_devices.empty()) {
-        std::vector<DeviceContext*> rank_contexts{&device};
-        std::vector<std::unique_ptr<DeviceContext>> owned_peers;
-        for (std::size_t s = 1; s < options.pp_devices.size(); ++s) {
-            owned_peers.push_back(std::make_unique<DeviceContext>(options.pp_devices[s]));
-            rank_contexts.push_back(owned_peers.back().get());
-        }
-        pipeline = std::make_unique<PpLink>(rank_contexts);
+        std::vector<int> peer_devices(options.pp_devices.begin() + 1, options.pp_devices.end());
+        pipeline = std::make_unique<PpLink>(device, peer_devices);
         for (std::size_t s = 1; s < options.pp_devices.size(); ++s) {
             DeviceContext& peer = pipeline->rank(s);
             artifact::Binder binder_s(reader);

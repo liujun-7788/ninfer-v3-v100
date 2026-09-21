@@ -27,8 +27,11 @@ inline constexpr std::size_t kPpMaxRanks = 8;
 // primary; a bundle owning peer contexts may sit beside the link).
 class PpLink {
 public:
+    // Non-owning: the caller keeps every rank DeviceContext alive.
     explicit PpLink(std::vector<DeviceContext*> ranks);
-    // Owning-peer convenience for the two-rank entry point (engine keeps rank0).
+    // Owning peers: the primary context stays caller-owned; the peer DeviceContexts are
+    // created (and owned) by the link — the engine-level entry point.
+    PpLink(DeviceContext& rank0, std::vector<int> peer_devices);
     PpLink(DeviceContext& rank0, int peer_device);
     ~PpLink();
 
@@ -76,6 +79,7 @@ private:
     std::vector<DeviceContext*> ranks_;
     Mailbox* mailbox_ = nullptr;
     std::unique_ptr<DeviceContext> peer_owner_;
+    std::vector<std::unique_ptr<DeviceContext>> owned_peers_;
 };
 
 } // namespace ninfer
