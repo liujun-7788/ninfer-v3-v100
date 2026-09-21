@@ -52,10 +52,12 @@
 7. V1 约束：--pp-devices 与 host-offload/context-cache/vision 互斥（启动时报错），
    max-concurrency 不变（引擎逻辑不动，PP 只影响 Program 内部）。
 
-### 步骤 5：加载分段（bindings.cpp / package.cpp）
-- LoadedModel 数组尺寸不变（编译期 16/48）；rank 只 materialize 自己层范围的张量，
-  其余层留 null view。embedding/vision → rank0；final_norm/output_head/MTP/proposal → rank1。
-- 在 package 构造处按 rank 切两次 device 上下文各加载一遍 artifact。
+### 步骤 5（已消灭，2026-09-21 晚定稿）：双卡全量加载
+关键简化：两张 32GB V100 都**全量加载 20GB 权重**（weights+KV+workspace ≈26GB 放得下）。
+层范围门控已在 TextContext 生效（rank0 执行 0-31、rank1 执行 32-63），范围外权重闲置。
+rank1 = 完整重复一遍 plan_load + materialize + construct_loaded_model（registry.cpp
+construct_registered 内加分支，DeviceContext 换 rank1），零切片、零 repack、零 binder 修改。
+代价：启动多 ~40s、每卡多 ~10GB 闲置权重。QPN 预打包按 rank 各自跑，地址互不相干。
 
 ### 步骤 6：CLI
 - serve_options/parse：`--pp-devices A,B`；engine.cpp：initialize_device 分支；
