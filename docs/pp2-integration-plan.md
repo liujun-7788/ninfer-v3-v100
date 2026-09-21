@@ -18,6 +18,47 @@
 
 ## 剩余工作（步骤 4-7 的精确落点）
 
+### 步骤 4c（唯一剩余）：调用点双 rank 化 —— 实施模式已定稿
+rank1 视图辅助（加两个私有方法，仿 11019 行 text_kv_view/mtp_kv_view）：
+```cpp
+qwen3_6::PagedKVCacheView text_kv_view1(const SequenceState& s) const {
+    return rank1->decoder->text_kv.execution_view(text_kv_addresses->execution_row(s.kv->text));
+}  // 页号/表内容经镜像与 rank0 一致
+qwen3_6::PagedKVCacheView mtp_kv_view1(const SequenceState& s) const; // 同理用 rank1->decoder->mtp_cache()
+```
+rank1 执行核（各调用点内联构造）：
+```cpp
+schedule::ExecutionCore core1{*pp_link->rank(1).device_ref?, ...}
+// 直接: {pp_link->rank(1) 作为 device? 不行——DeviceContext& 需引用:
+//   DeviceContext& d1 = pp_link->rank(1);
+//   {d1, *rank1->model, *rank1->work, rank1->state_images->linear(),
+//    rank1->replay_records?&*…:nullptr, *rank1->io, rank1->prefill_hidden, prefill_chunk,
+//    proposal_head, pp_split, TextConfig::layers, gdn/attn offset=pp_split/0, pp_link, site, rank=1,
+//    peer_hidden=nullptr(首rank), boundary=rank1->boundary.data}
+```
+pipeline 字段：rank0 = {layer_begin=0, layer_end=pp_split, gdn_offset=0, attn_offset=0,
+pp=link, rank=0}；rank1 = {layer_begin=pp_split, layer_end=TextConfig::layers,
+gdn_offset=pp_split 中 GDN 层数=24, attn_offset=8, pp=link, rank=1,
+boundary_local=rank1->boundary.data}。注意 gdn/attn offset = 各自层段起点（GDN 24、
+attention 8，因 64 层=4 组(3 GDN+1 attn)）。
+
+需双 rank 化的调用点（当前行号）：
+1. advance_prefill_raw ~11634 schedule_state 构造 + ~11660 MTP bridge + ~11723
+   prefill chunk 调用：包 rank 循环（rank0 现有成员；rank1 用 rank1_state），
+   KV view 用 *view1；host 采样只在 rank1（final_candidate 分支已由 TextContext
+   pp_last 门控）。
+2. decode_raw ~11966 ordinary_decode_batch：OrdinaryBatchContext 双份；
+   host ingress 双写；egress 读 rank1；rank0 图体已无（V1 无图）。
+   解码闸门：rank1 上下文调用前 pp_link->signal? 精确协议——每轮：
+   rank0: [ack-wait(arm 零武装, site_ack)] → execution → push(site_hidden)
+   rank1: [wait(site_hidden)] → execution → signal(site_ack)
+3. mtp_decode_raw ~12167：同 2，site 分离。
+4. causal_score ~1229：V1 直接 throw（PP 不支持评分用途）。
+5. warmup 图捕获区 11262-11364：use_cuda_graph=false 时整体不执行，无需改。
+
+PpLink 需暴露 non-const rank() 已有 ✓。RoundState 的 host ingress 双写：decode_raw 的
+ingress 填充代码对 rank1 的 *rank1->io->ordinary->ingress… 复制一份（结构同构）。
+
 ### 步骤 4：ProgramImplCore 双 rank 化（program_impl.h）
 已确认的关键锚点：
 - `execution_core` lambda 在 ~11182 行（warmup 图捕获区），构造 ExecutionCore 的唯一工厂；
