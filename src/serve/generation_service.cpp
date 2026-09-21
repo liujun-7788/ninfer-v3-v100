@@ -235,6 +235,7 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     ninfer::EngineOptions engine_options;
     engine_options.artifact_path            = options_.artifact_path;
     engine_options.device                   = options_.device;
+    engine_options.pp_peer_device           = options_.pp_peer_device;
     engine_options.max_context              = options_.max_context;
     engine_options.kv_capacity              = options_.kv_capacity;
     engine_options.max_concurrency          = options_.max_concurrency;
