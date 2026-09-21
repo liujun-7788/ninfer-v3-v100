@@ -10,6 +10,7 @@
 
 namespace ninfer {
 
+class PpLink;
 struct DeviceContext;
 
 namespace targets {
@@ -35,12 +36,16 @@ struct Qwen3_6_27BInstance {
     std::unique_ptr<LoadedQwen3_6_27B> loaded;
     runtime::KvCapacityResolution kv_capacity_resolution;
     const std::uint32_t capacity;
+    std::unique_ptr<PpLink> pp;
+    std::unique_ptr<Qwen3_6_27B::LoadedModel> rank1_model;
     std::unique_ptr<Qwen3_6_27B::Program> program;
 
     Qwen3_6_27BInstance(std::unique_ptr<LoadedQwen3_6_27B> stable_loaded,
                         runtime::KvCapacityResolution resolution,
                         Qwen3_6_27B::SequencePlan sequence_plan, DeviceContext& device,
-                        const StartupObserver& startup_observer);
+                        const StartupObserver& startup_observer,
+                        std::unique_ptr<PpLink> pipeline = {},
+                        std::unique_ptr<Qwen3_6_27B::LoadedModel> pipeline_rank1_model = {});
     ~Qwen3_6_27BInstance();
 
     Qwen3_6_27BInstance(const Qwen3_6_27BInstance&)            = delete;
@@ -70,7 +75,9 @@ struct Qwen3_6_35BA3BInstance {
     Qwen3_6_35BA3BInstance(std::unique_ptr<LoadedQwen3_6_35BA3B> stable_loaded,
                            runtime::KvCapacityResolution resolution,
                            Qwen3_6_35BA3B::SequencePlan sequence_plan, DeviceContext& device,
-                           const StartupObserver& startup_observer);
+                           const StartupObserver& startup_observer,
+                           std::unique_ptr<PpLink> pipeline                            = {},
+                           std::unique_ptr<Qwen3_6_35BA3B::LoadedModel> rank1_model_35b = {});
     ~Qwen3_6_35BA3BInstance();
 
     Qwen3_6_35BA3BInstance(const Qwen3_6_35BA3BInstance&)            = delete;
