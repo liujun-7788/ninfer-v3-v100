@@ -48,6 +48,10 @@ public:
     // first expected generation is zero.
     void arm_zero_wait(std::size_t consumer, std::size_t site);
 
+    // Enqueue on the rank's stream: publish this round's generation without a transfer
+    // (reverse-direction completion acks for the decode turnstile).
+    void signal(std::size_t rank, std::size_t site);
+
 private:
     struct Mailbox {
         unsigned long long flag[kRankCount][kPpMaxSites];
