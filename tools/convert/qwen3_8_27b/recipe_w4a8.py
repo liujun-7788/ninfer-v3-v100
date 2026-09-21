@@ -173,46 +173,47 @@ def _build_nvfp4_matrix_recipes() -> tuple[
 ]:
     nvfp4_weights: list[Nvfp4WeightRecipe] = []
     input_divisors: list[InputDivisorRecipe] = []
-    for layer in inventory.NVFP4_GATE_UP_LAYERS:
+    for layer in range(64):
         source_prefix = f"model.language_model.layers.{layer}."
         object_prefix = f"text/layers/{layer}/"
-        gate = _source(source_prefix + "mlp.gate_proj", 17408, 5120)
-        up = _source(source_prefix + "mlp.up_proj", 17408, 5120)
-        sources = (gate, up)
-        nvfp4_weights.append(
-            Nvfp4WeightRecipe(
-                object_prefix + "mlp/gate_up",
-                (34816, 5120),
-                (_all(gate), _all(up)),
-                sources,
+        if layer in inventory.NVFP4_GATE_UP_LAYERS:
+            gate = _source(source_prefix + "mlp.gate_proj", 17408, 5120)
+            up = _source(source_prefix + "mlp.up_proj", 17408, 5120)
+            sources = (gate, up)
+            nvfp4_weights.append(
+                Nvfp4WeightRecipe(
+                    object_prefix + "mlp/gate_up",
+                    (34816, 5120),
+                    (_all(gate), _all(up)),
+                    sources,
+                )
             )
-        )
-        input_divisors.append(
-            InputDivisorRecipe(
-                object_prefix + "mlp/gate_up_projection/input_scale_divisor",
-                sources,
-                (object_prefix + "mlp/gate_up",),
+            input_divisors.append(
+                InputDivisorRecipe(
+                    object_prefix
+                    + "mlp/gate_up_projection/input_scale_divisor",
+                    sources,
+                    (object_prefix + "mlp/gate_up",),
+                )
             )
-        )
-    for layer in inventory.NVFP4_DOWN_LAYERS:
-        source_prefix = f"model.language_model.layers.{layer}."
-        object_prefix = f"text/layers/{layer}/"
-        down = _source(source_prefix + "mlp.down_proj", 5120, 17408)
-        nvfp4_weights.append(
-            Nvfp4WeightRecipe(
-                object_prefix + "mlp/down",
-                down.shape,
-                (_all(down),),
-                (down,),
+        if layer in inventory.NVFP4_DOWN_LAYERS:
+            down = _source(source_prefix + "mlp.down_proj", 5120, 17408)
+            nvfp4_weights.append(
+                Nvfp4WeightRecipe(
+                    object_prefix + "mlp/down",
+                    down.shape,
+                    (_all(down),),
+                    (down,),
+                )
             )
-        )
-        input_divisors.append(
-            InputDivisorRecipe(
-                object_prefix + "mlp/down_projection/input_scale_divisor",
-                (down,),
-                (object_prefix + "mlp/down",),
+            input_divisors.append(
+                InputDivisorRecipe(
+                    object_prefix
+                    + "mlp/down_projection/input_scale_divisor",
+                    (down,),
+                    (object_prefix + "mlp/down",),
+                )
             )
-        )
     return tuple(nvfp4_weights), tuple(input_divisors)
 
 
@@ -401,7 +402,9 @@ def validate_recipe() -> None:
     if all_names != {spec.name for spec in inventory.BASE_TENSOR_SPECS}:
         raise ValueError("source routes do not cover the base tensor inventory")
     if tuple(FP8_WEIGHTS_BY_NAME) != tuple(
-        spec.name for spec in inventory.FP8_TENSOR_SPECS
+        spec.name
+        for spec in inventory.FP8_TENSOR_SPECS
+        if spec.name not in ("text/token_embedding", "text/output_head")
     ):
         raise ValueError("FP8 recipe order does not match inventory")
     if tuple(NVFP4_WEIGHTS_BY_NAME) != tuple(
