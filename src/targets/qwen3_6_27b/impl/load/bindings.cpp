@@ -42,8 +42,10 @@ NumericFormat endpoint_format(WeightsProfile weights_profile) {
         return NumericFormat::Q6G64_F16S;
     case WeightsProfile::Qwen38GroupwiseInt:
     case WeightsProfile::Qwen36Nvfp4:
+    case WeightsProfile::Qwen38Nvfp4W4a4:
         return NumericFormat::W8G32_F16S;
     case WeightsProfile::Qwen38Nvfp4:
+    case WeightsProfile::Qwen38Nvfp4Mixed:
         return NumericFormat::FP8_E4M3FN_ROW_BF16S;
     }
     throw std::invalid_argument("qwen3_6_27b: invalid weights profile");
@@ -184,8 +186,12 @@ DensePostMixerPayload load_mlp(const MlpPlan& plan,
     out.gate_up = materialized_weight(materialized, plan.gate_up, 34816, 5120);
     out.down    = materialized_weight(materialized, plan.down, 5120, 17408);
 #ifdef NINFER_VOLTA_BUILD
+    // The mixed profile allows gate_up and down formats to differ; prepack
+    // each NVFP4 weight on its own qtype instead of keying off gate_up.
     if (out.gate_up.qtype == QType::NVFP4) {
         ::ninfer::ops::detail::nvfp4_prepack_qpn_sm70(out.gate_up);
+    }
+    if (out.down.qtype == QType::NVFP4) {
         ::ninfer::ops::detail::nvfp4_prepack_qpn_sm70(out.down);
     }
 #endif
@@ -414,6 +420,131 @@ void bind_qwen38_nvfp4_text_layers(artifact::Binder& binder, BindingPlan& out) {
     }
 }
 
+void bind_qwen38_nvfp4_w4a4_text_layers(artifact::Binder& binder, BindingPlan& out) {
+    for (std::size_t layer = 0; layer < kTextLayers; ++layer) {
+        TextLayerPlan& target    = out.text_layers[layer];
+        const std::string prefix = "text/layers/" + std::to_string(layer) + "/";
+        target.input_norm        = artifact::bind_device_tensor(binder, prefix + "input_norm",
+                                                                NumericFormat::BF16, {5120});
+        target.is_full_attention = is_full_layer(layer);
+        if (target.is_full_attention) {
+            target.attention.projection = FusedAttentionProjectionPlan{
+                .query_key_gate_value =
+                    bind_nvfp4_weight(
+                        binder, prefix + "attention/query_key_gate_value", 14336, 5120,
+                        prefix + "attention/input_projection/input_scale_divisor"),
+            };
+            target.attention.query_norm = artifact::bind_device_tensor(
+                binder, prefix + "attention/query_norm", NumericFormat::BF16, {256});
+            target.attention.key_norm = artifact::bind_device_tensor(
+                binder, prefix + "attention/key_norm", NumericFormat::BF16, {256});
+            target.attention.output =
+                bind_nvfp4_weight(binder, prefix + "attention/output", 5120, 6144,
+                                  prefix + "attention/output_projection/input_scale_divisor");
+        } else {
+            target.gdn.a_log       = artifact::bind_device_tensor(binder, prefix + "gdn/a_log",
+                                                                  NumericFormat::FP32, {48});
+            target.gdn.dt_bias     = artifact::bind_device_tensor(binder, prefix + "gdn/dt_bias",
+                                                                  NumericFormat::FP32, {48});
+            target.gdn.convolution = artifact::bind_device_tensor(
+                binder, prefix + "gdn/convolution", NumericFormat::BF16, {4, 10240});
+            target.gdn.control_projection = FusedGdnControlProjectionPlan{
+                .a_b_projection = bind_weight(binder, prefix + "gdn/a_b_projection",
+                                              NumericFormat::BF16, {96, 5120}),
+            };
+            target.gdn.input_projection = FusedGdnInputProjectionPlan{
+                .query_key_value_z =
+                    bind_nvfp4_weight(binder, prefix + "gdn/query_key_value_z", 16384, 5120,
+                                      prefix + "gdn/input_projection/input_scale_divisor"),
+            };
+            target.gdn.norm = artifact::bind_device_tensor(binder, prefix + "gdn/norm",
+                                                           NumericFormat::BF16, {128});
+            target.gdn.output =
+                bind_nvfp4_weight(binder, prefix + "gdn/output", 5120, 6144,
+                                  prefix + "gdn/output_projection/input_scale_divisor");
+        }
+        target.post_attention_norm = artifact::bind_device_tensor(
+            binder, prefix + "post_attention_norm", NumericFormat::BF16, {5120});
+        target.mlp.gate_up =
+            bind_nvfp4_weight(binder, prefix + "mlp/gate_up", 34816, 5120,
+                              prefix + "mlp/gate_up_projection/input_scale_divisor");
+        target.mlp.down = bind_nvfp4_weight(binder, prefix + "mlp/down", 5120, 17408,
+                                            prefix + "mlp/down_projection/input_scale_divisor");
+    }
+}
+
+// Merkyor W4A4+W8A8 allocation: FP8 projections everywhere; MLP modules are
+// NVFP4 or FP8 per the fixed per-layer sets from the source quantization
+// config (group_0 / group_1).
+constexpr std::array<std::size_t, 15> kMixedFp8GateUpLayers = {
+    0, 1, 2, 3, 50, 52, 54, 56, 57, 58, 59, 60, 61, 62, 63,
+};
+constexpr std::array<std::size_t, 22> kMixedFp8DownLayers = {
+    0, 1, 2, 3, 21, 42, 44, 46, 48, 49, 50, 52, 53, 54,
+    56, 57, 58, 59, 60, 61, 62, 63,
+};
+
+template <std::size_t N>
+bool mixed_layer_is_fp8(std::size_t layer, const std::array<std::size_t, N>& layers) {
+    return std::find(layers.begin(), layers.end(), layer) != layers.end();
+}
+
+void bind_qwen38_nvfp4_mixed_text_layers(artifact::Binder& binder, BindingPlan& out) {
+    constexpr NumericFormat kFp8 = NumericFormat::FP8_E4M3FN_ROW_BF16S;
+    for (std::size_t layer = 0; layer < kTextLayers; ++layer) {
+        TextLayerPlan& target    = out.text_layers[layer];
+        const std::string prefix = "text/layers/" + std::to_string(layer) + "/";
+        target.input_norm        = artifact::bind_device_tensor(binder, prefix + "input_norm",
+                                                                NumericFormat::BF16, {5120});
+        target.is_full_attention = is_full_layer(layer);
+        if (target.is_full_attention) {
+            target.attention.projection = FusedAttentionProjectionPlan{
+                .query_key_gate_value = bind_weight(
+                    binder, prefix + "attention/query_key_gate_value", kFp8, {14336, 5120}),
+            };
+            target.attention.query_norm = artifact::bind_device_tensor(
+                binder, prefix + "attention/query_norm", NumericFormat::BF16, {256});
+            target.attention.key_norm = artifact::bind_device_tensor(
+                binder, prefix + "attention/key_norm", NumericFormat::BF16, {256});
+            target.attention.output =
+                bind_weight(binder, prefix + "attention/output", kFp8, {5120, 6144});
+        } else {
+            target.gdn.a_log       = artifact::bind_device_tensor(binder, prefix + "gdn/a_log",
+                                                                  NumericFormat::FP32, {48});
+            target.gdn.dt_bias     = artifact::bind_device_tensor(binder, prefix + "gdn/dt_bias",
+                                                                  NumericFormat::FP32, {48});
+            target.gdn.convolution = artifact::bind_device_tensor(
+                binder, prefix + "gdn/convolution", NumericFormat::BF16, {4, 10240});
+            target.gdn.control_projection = FusedGdnControlProjectionPlan{
+                .a_b_projection = bind_weight(binder, prefix + "gdn/a_b_projection",
+                                              NumericFormat::BF16, {96, 5120}),
+            };
+            target.gdn.input_projection = FusedGdnInputProjectionPlan{
+                .query_key_value_z =
+                    bind_weight(binder, prefix + "gdn/query_key_value_z", kFp8, {16384, 5120}),
+            };
+            target.gdn.norm = artifact::bind_device_tensor(binder, prefix + "gdn/norm",
+                                                           NumericFormat::BF16, {128});
+            target.gdn.output = bind_weight(binder, prefix + "gdn/output", kFp8, {5120, 6144});
+        }
+        target.post_attention_norm = artifact::bind_device_tensor(
+            binder, prefix + "post_attention_norm", NumericFormat::BF16, {5120});
+        if (mixed_layer_is_fp8(layer, kMixedFp8GateUpLayers)) {
+            target.mlp.gate_up = bind_weight(binder, prefix + "mlp/gate_up", kFp8, {34816, 5120});
+        } else {
+            target.mlp.gate_up =
+                bind_nvfp4_weight(binder, prefix + "mlp/gate_up", 34816, 5120,
+                                  prefix + "mlp/gate_up_projection/input_scale_divisor");
+        }
+        if (mixed_layer_is_fp8(layer, kMixedFp8DownLayers)) {
+            target.mlp.down = bind_weight(binder, prefix + "mlp/down", kFp8, {5120, 17408});
+        } else {
+            target.mlp.down = bind_nvfp4_weight(binder, prefix + "mlp/down", 5120, 17408,
+                                                prefix + "mlp/down_projection/input_scale_divisor");
+        }
+    }
+}
+
 DFlash2Plan bind_dflash2(artifact::Binder& binder, artifact::TensorPlacement placement) {
     const auto bind_tensor = [&](std::string_view name, NumericFormat format,
                                  std::initializer_list<std::uint64_t> shape) {
@@ -504,6 +635,12 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
         break;
     case WeightsProfile::Qwen38Nvfp4:
         bind_qwen38_nvfp4_text_layers(binder, out);
+        break;
+    case WeightsProfile::Qwen38Nvfp4W4a4:
+        bind_qwen38_nvfp4_w4a4_text_layers(binder, out);
+        break;
+    case WeightsProfile::Qwen38Nvfp4Mixed:
+        bind_qwen38_nvfp4_mixed_text_layers(binder, out);
         break;
     default:
         throw std::invalid_argument("qwen3_6_27b: invalid weights profile");
