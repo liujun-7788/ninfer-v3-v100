@@ -5,6 +5,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 
 namespace ninfer {
 
@@ -22,9 +23,11 @@ class PpLink {
 public:
     static constexpr std::size_t kRankCount = 2;
 
-    // Non-owning: the caller keeps the rank DeviceContexts alive (the engine owns rank0's
-    // context; a peer DeviceContext may be owned by the same layer).
+    // Non-owning pair: the caller keeps both rank DeviceContexts alive.
     PpLink(DeviceContext& rank0, DeviceContext& rank1);
+    // Owning peer: the primary context stays caller-owned; the peer DeviceContext is
+    // created (and owned) by the link — the engine-level entry point.
+    PpLink(DeviceContext& rank0, int peer_device);
     ~PpLink();
 
     PpLink(const PpLink&)            = delete;
@@ -60,7 +63,9 @@ private:
     };
 
     void enable_peer_access();
+    void init_mailbox();
 
+    std::unique_ptr<DeviceContext> peer_owner_;
     std::array<DeviceContext*, kRankCount> ranks_{};
     Mailbox* mailbox_                         = nullptr;
     unsigned long long* counters_[kRankCount] = {nullptr, nullptr};
