@@ -25,6 +25,19 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
                          state.execution.linear_attention, state.execution.io,
                          state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
                          &state.text_cache);
+        if (state.execution.pp != nullptr) {
+            card.set_pipeline({state.execution.layer_begin,
+                               state.execution.layer_end,
+                               state.execution.gdn_offset,
+                               state.execution.attn_offset,
+                               state.execution.pp,
+                               state.execution.pp_site_in,
+                               state.execution.pp_site_out,
+                               state.execution.pp_rank,
+                               state.execution.peer_hidden,
+                               state.execution.peer_hidden_bytes,
+                               state.execution.boundary_local});
+        }
 
         Tensor tokens             = ordinary.tokens.slice(0, 0, batch_size);
         Tensor cache_positions    = ordinary.cache_positions.slice(0, 0, batch_size);

@@ -1082,6 +1082,9 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
             stage.state_images =
                 std::make_unique<qwen3_6::StateImageDevicePool>(backing_s,
                                                                 plan.persistent.state_images);
+            qwen3_6::StateImageDevicePool& primary_state_images =
+                s == 1 ? *this->state_images : *pp_stages[s - 2].state_images;
+            primary_state_images.add_mirror(*stage.state_images);
             if (plan.persistent.replay_records) {
                 stage.replay_records.emplace(backing_s, *plan.persistent.replay_records);
                 stage.replay_fold.emplace(*stage.replay_records,
@@ -11084,6 +11087,17 @@ qwen3_6::PagedKVCacheView ProgramImplCore::mtp_kv_view_stage(
 
 schedule::ExecutionCore ProgramImplCore::rank_core(std::size_t rank, const GdnReplayRecords* records,
                                                    std::size_t hidden_site_base) {
+    if (rank == 0 && pp_stage_count == 0) {
+        return schedule::ExecutionCore{device,
+                                       model,
+                                       work,
+                                       state_images->linear(),
+                                       records,
+                                       io,
+                                       prefill_hidden,
+                                       prefill_chunk,
+                                       proposal_head};
+    }
     if (rank >= pp_stage_count) { throw std::logic_error("pipeline stage is missing"); }
     if (rank == 0) {
         return schedule::ExecutionCore{device,
@@ -12186,6 +12200,11 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             }
         }
         if (pp_link != nullptr) { pp_link->rank(0).bind_to_current_thread(); }
+        if (std::getenv("NINFER_PP_DEBUG") != nullptr) {
+            std::fprintf(stderr, "[PP] round: ingress_tok=%u egress_tok=%u\n",
+                         static_cast<unsigned>(ordinary_host_ingress->tokens[0]),
+                         static_cast<unsigned>(ordinary_host_egress->sampled_tokens[0]));
+        }
         submit_range.reset();
         timing.begin_wait();
         {
