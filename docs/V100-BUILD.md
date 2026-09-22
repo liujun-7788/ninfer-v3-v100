@@ -164,6 +164,13 @@ Official upstream v3 artifacts load directly with this fork, e.g.
 [neroued/Qwen3.8-27B-nvfp4-NInfer](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer).
 v2 artifacts (magic `NInfer\0\2`) keep working unchanged.
 
+Community checkpoint **Qwen3.8-27B EfficientThink-K3-MTP-NVFP4** (`nvfp4-mixed`
+weights: FP8 projections + per-module NVFP4/FP8 MLP) is also supported —
+download from
+[ModelScope](https://www.modelscope.cn/models/chengxian7788/Qwen3.8-27B-EfficientThink-K3-MTP-NVFP4-Ninfer);
+launch recipe, verified capacity limits, and benchmarks:
+[docs/QWEN38-27B-EFFICIENTTHINK-K3.md](QWEN38-27B-EFFICIENTTHINK-K3.md).
+
 ## Docker
 
 A runtime image with the prebuilt server binary is documented in
@@ -171,3 +178,10 @@ A runtime image with the prebuilt server binary is documented in
 `docker build -t ninfer-v100 .`, then one `docker run --gpus all` (or
 `docker compose up -d`). Windows hosts work the same way via Docker Desktop
 (WSL2 backend). The V100 (sm_70) requirement is unchanged.
+
+**Updating an existing install** (Docker or source build): `git pull`, grab the
+latest prebuilt binary from the
+[Releases page](../../releases) - **v2 or newer is required for `nvfp4-mixed`
+artifacts; the v1 binary predates that profile** - then rebuild the image (or
+`cmake --build build-v100`) and restart. Model volumes/artifacts are untouched
+by the update; v2/official-v3/mixed artifacts all keep loading.
