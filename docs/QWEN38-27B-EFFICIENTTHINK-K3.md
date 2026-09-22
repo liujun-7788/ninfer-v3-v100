@@ -12,24 +12,27 @@
 CUDA_VISIBLE_DEVICES=2 build-v100/apps/ninfer-serve \
   /data/models/ninfer/qwen3_8_27b_nvfp4_EfficientThink_K3.ninfer \
   --host 0.0.0.0 --port 7006 --device 0 --model-id qwen3.8-27b \
-  --max-context 221184 --prefill-chunk 1024 --kv-capacity auto \
+  --max-context 215040 --prefill-chunk 2048 --kv-capacity auto \
   --max-concurrency 1 --kv-dtype int8 --device-state-slots 1 \
-  --host-state-slots 8 --host-kv-mib 4096 \
+  --host-state-slots 8 --host-kv-mib 8192 \
   --spec mtp --draft-tokens 3 --lm-head-draft --preserve-thinking \
-  --pending-timeout-ms 600000 --log-level info
+  --pending-timeout-ms 600000 --vision --log-level info
 ```
 
 启动成功的日志基线：
 
 ```
-weights ready | 20.7 GiB
-capacity | KV 221,184 tokens, int8, auto | pages 3,456/3,456 | runtime 9.33 GiB | free 1.48 GiB
+weights ready | 21.0 GiB
+capacity | KV 215,040 tokens, int8, auto | pages 3,360/3,360 | runtime 9.33 GiB | free 1.20 GiB
 listening on http://0.0.0.0:7006 | model qwen3.8-27b
 ```
 
-> **221,184 是 V100 32G 的结构上限**（混合权重 22.3GB 比 stock 大 1.9GB，运行时预留随
-> max-context 线性增长；230,000 实测规划期超限约 0.7GB）。`--kv-capacity auto` 自带的
-> 1024 MiB 安全余量无法被利用，属引擎设计行为。
+> **215,040 是"开视觉 + prefill 2048 + host-kv 8192"全参数下的 V100 32G 上限**。
+> 230,000 在该配置下启动即规划超限；221,184 差约 172MiB 也被拒（vision 媒体缓存 1.0 GiB +
+> 活跃 2.0 GiB 与更大的 prefill 工作区合计比无视觉配置多占约 1.5GiB）。215,040 时 KV
+> 3,360 页全满、余 1.20 GiB。若去掉 `--vision` 并降为 prefill 1024 / host-kv 4096，上限可
+> 回到 221,184（KV 3,456 页、余 1.48 GiB）。`--kv-capacity auto` 自带的 1024 MiB 安全余量
+> 无法被利用，属引擎设计行为。
 
 ## 基准
 
