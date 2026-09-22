@@ -84,16 +84,51 @@ cmake --build build-v100 -j$(nproc)
 
 ## Runtime flags that matter on V100
 
-A production line we run daily (Qwen3.8-27B NVFP4, official v3 artifact):
+Our production line, verified daily on a V100-PCIE-32GB (Qwen3.8-27B NVFP4,
+official v3 artifact, vision enabled, 2 concurrent slots):
 
 ```bash
 build-v100/apps/ninfer-serve /path/to/qwen3_8_27b_nvfp4.ninfer \
-  --host 127.0.0.1 --port 7105 --device 0 --model-id qwen3.8-27b \
-  --max-context 131072 --kv-capacity auto --max-concurrency 1 \
-  --kv-dtype int8 --device-state-slots 1 --host-state-slots 8 \
+  --host 0.0.0.0 --port 7106 --device 1 --model-id qwen3.8-27b \
+  --max-context 230000 --kv-capacity auto --max-concurrency 2 \
+  --kv-dtype int8 --device-state-slots 2 --host-state-slots 8 \
   --host-kv-mib 8192 --spec mtp --draft-tokens 3 --lm-head-draft \
-  --preserve-thinking --pending-timeout-ms 600000
+  --preserve-thinking --pending-timeout-ms 600000 --vision --log-level info
 ```
+
+This is the **largest context that fits a 32 GB card** with vision on and 2
+concurrent slots: 230000 maps to a 230,208-token KV pool with ~10 MB of spare
+VRAM. `--max-context 240000` fails planning (it needs ~1.68 GiB more than
+what is left after the 20.0 GiB of weights); step down to 220000/200000 if
+your card hosts anything else.
+
+Recommended host setup (measured, not cosmetic):
+
+```bash
+sudo nvidia-smi -pm 1                      # persistence mode
+sudo nvidia-smi -lgc 1380,1380 -i <gpu>    # lock the SM clock at max boost
+```
+
+Without these we caught the SM drifting to ~1245 MHz under sustained decode
+(-10% vs the 1380 MHz boost clock) — a straight ITL loss plus per-token
+jitter from DVFS.
+
+KV dtype guide on Volta (measured bytes per token per 256-dim head, K+V):
+
+| `--kv-dtype` | bytes | notes |
+|---|---:|---|
+| `bf16` | 1024 | upstream default; wasteful on 32 GB cards |
+| `int8` | 528 | **what we run**; 230,208-token pool at the recipe above |
+| `fp8` | 516 | fits **263,424 tokens (+14.4%)**, but **decode measurably slower than int8 under real workloads** (only a tiny-probe benchmark missed this) — use it only if you must have the bigger window and accept the speed loss |
+| `k8v4` / `nvfp4` | — | **rejected on Volta at planning time** (`NVFP4 KV-cache storage is unavailable on Volta`) even though the CLI accepts the values |
+
+Measured at this recipe (128-token completions, 1 discarded warmup + 3
+repeats), prefill / decode tok/s by context:
+
+| ctx | 2K | 8K | 16K | 32K | 64K | 128K |
+|---|---:|---:|---:|---:|---:|---:|
+| prefill | 1043 | 1070 | 1012 | 907 | 737 | 526 |
+| decode | 96 | 105 | 104 | 69 | 73 | 45 |
 
 - **CUDA Graphs work on V100** (capture ~0.3–0.7 s at these settings). If
   capture OOMs, your KV budget is too aggressive for the free VRAM: lower
@@ -128,3 +163,11 @@ build-v100/apps/ninfer-serve /path/to/qwen3_8_27b_nvfp4.ninfer \
 Official upstream v3 artifacts load directly with this fork, e.g.
 [neroued/Qwen3.8-27B-nvfp4-NInfer](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer).
 v2 artifacts (magic `NInfer\0\2`) keep working unchanged.
+
+## Docker
+
+A runtime image with the prebuilt server binary is documented in
+[`docker/README.md`](../docker/README.md): download the release tarball,
+`docker build -t ninfer-v100 .`, then one `docker run --gpus all` (or
+`docker compose up -d`). Windows hosts work the same way via Docker Desktop
+(WSL2 backend). The V100 (sm_70) requirement is unchanged.
