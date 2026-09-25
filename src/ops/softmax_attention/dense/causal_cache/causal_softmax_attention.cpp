@@ -26,7 +26,7 @@ constexpr std::uint32_t kThreeChunkPromptVisibleKeys = 1024;
 std::int32_t causal_attention_chunk_tokens(std::int32_t q_heads, std::int32_t width,
                                            std::int32_t batch_size, KvCacheStorage storage,
                                            CausalAttentionExecutionEnvelope envelope) {
-    if (q_heads == 16) return 6;
+    if (q_heads == 16 || q_heads == 12) return 6;
     // Balance the two narrow BF16 chunks; INT8 benefits from 5+4/5 at long contexts.
     if (batch_size == 1 && ((storage == KvCacheStorage::BFloat16 && width >= 9 && width <= 12) ||
                             (storage == KvCacheStorage::Int8Group64 && width >= 9 && width <= 10 &&
@@ -38,7 +38,8 @@ std::int32_t causal_attention_chunk_tokens(std::int32_t q_heads, std::int32_t wi
 void require_causal_geometry(AttentionHeadGeometry geometry, const char* op) {
     if (!valid_attention_head_geometry(geometry) || geometry.head_dim != kHeadDim ||
         !((geometry.query_heads == 24 && geometry.kv_heads == 4) ||
-          (geometry.query_heads == 16 && geometry.kv_heads == 2))) {
+          (geometry.query_heads == 16 && geometry.kv_heads == 2) ||
+          (geometry.query_heads == 12 && geometry.kv_heads == 2))) {
         throw std::invalid_argument(std::string(op) + ": unsupported head geometry");
     }
 }
@@ -211,7 +212,10 @@ void validate_attention_tensors(const Tensor& q, const Tensor& positions, const 
     require_contiguous_nonnull(positions, op, "positions");
     require_contiguous_nonnull(out, op, "out");
     if (cache.num_kv_heads != kv_heads) {
-        throw std::invalid_argument(std::string(op) + ": invalid KV cache head geometry");
+        throw std::invalid_argument(std::string(op) + ": invalid KV cache head geometry [cache=" +
+                                    std::to_string(cache.num_kv_heads) + " geom=" +
+                                    std::to_string(kv_heads) + " q_heads=" +
+                                    std::to_string(q_heads) + "]");
     }
     validate_envelope(envelope, cache, tokens, op);
 }
@@ -253,7 +257,10 @@ void validate_batched_attention_tensors(const Tensor& q, const Tensor& positions
     require_contiguous_nonnull(kv_table_rows, op, "KV table rows");
     require_contiguous_nonnull(out, op, "out");
     if (cache.num_kv_heads != kv_heads) {
-        throw std::invalid_argument(std::string(op) + ": invalid KV cache head geometry");
+        throw std::invalid_argument(std::string(op) + ": invalid KV cache head geometry [cache=" +
+                                    std::to_string(cache.num_kv_heads) + " geom=" +
+                                    std::to_string(kv_heads) + " q_heads=" +
+                                    std::to_string(q_heads) + "]");
     }
     const std::uint32_t capacity = validate_batch_cache(cache, kv_heads, op);
     if (cache.block_tables.ne[1] < batch || envelope.min_visible_keys == 0 ||

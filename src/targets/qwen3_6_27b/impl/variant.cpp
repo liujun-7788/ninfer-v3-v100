@@ -226,10 +226,15 @@ void Variant::attention_output_projection(const Tensor& attention, const Weight&
                                           Tensor& residual, qwen3_6::TextPhase,
                                           WorkspaceArena& workspace, cudaStream_t stream) {
     // TP2: the out projection is K-sharded to 3072; each rank computes its half into the
-    // site-0 delta buffer and the allreduce sums it into the residual.
+    // site-0 delta buffer and the allreduce sums it into the residual. Heads mode already
+    // produces exactly this rank's half (rows == weight.k), so no staging is needed there;
+    // the replicated-attention modes stage the rank's half of the full-width activation.
     if (tpexec::active() && weight.k == 3072) {
         const int tokens = attention.ne[1];
-        Tensor input     = tp2_stage_k_half(attention, weight.k, tokens, workspace, stream);
+        const int rows   = static_cast<int>(attention.numel()) / tokens;
+        Tensor input     = rows == weight.k
+                               ? attention.view({weight.k, tokens})
+                               : tp2_stage_k_half(attention, weight.k, tokens, workspace, stream);
         Tensor delta     = tpexec::site_delta(0, tokens);
         ops::linear(input, weight, delta, text_policy(weight), workspace, stream);
         tpexec::allreduce_bf16(0, tokens);

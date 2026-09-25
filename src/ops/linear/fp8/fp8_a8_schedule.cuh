@@ -38,4 +38,11 @@ struct Fp8LinearA8ProductionSchedule<Fp8Residual17408Geometry> {
                                 Fp8MmaFragmentPipeline::PingPong, Fp8MmaRaster::TokenFast>;
 };
 
+// TP2 shard geometries inherit the fused problems' schedules.
+template <>
+struct Fp8LinearA8ProductionSchedule<Fp8AttnInputShardGeometry> {
+    using Type = Fp8MmaSchedule<64, 128, 128, 2, 4, 2, 2, Cache::cg, Cache::cg,
+                                Fp8MmaFragmentPipeline::PingPong, Fp8MmaRaster::TokenFast>;
+};
+
 } // namespace ninfer::ops::detail

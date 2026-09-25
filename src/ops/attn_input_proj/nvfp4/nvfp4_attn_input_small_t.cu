@@ -15,28 +15,30 @@ namespace {
 using Launch = void (*)(const Tensor&, const Weight&, Tensor&, Tensor&, Tensor&, Tensor&,
                         cudaStream_t);
 
+// Fused row order q | key | gate | value with q_rows = gate_rows = 3/14 of the parent rows and
+// key_rows = value_rows = 1/14; holds for the full projection and the TP2 head-split shard.
+template <class Geometry>
 struct Nvfp4AttentionInputSmallTOutput {
     __nv_bfloat16* query;
     __nv_bfloat16* key;
     __nv_bfloat16* gate;
     __nv_bfloat16* value;
 
+    static constexpr std::int32_t kQueryRows  = Geometry::kOutputRows * 3 / 7;
+    static constexpr std::int32_t kKeyRows    = Geometry::kOutputRows / 14;
+    static constexpr std::int32_t kKeyBegin   = kQueryRows;
+    static constexpr std::int32_t kGateBegin  = kKeyBegin + kKeyRows;
+    static constexpr std::int32_t kValueBegin = kGateBegin + kQueryRows;
+
     __device__ __forceinline__ void store(std::int32_t parent_row, std::int32_t token,
                                           float result) const {
-        constexpr std::int32_t kQueryRows  = 6144;
-        constexpr std::int32_t kKeyRows    = 1024;
-        constexpr std::int32_t kGateRows   = 6144;
-        constexpr std::int32_t kKeyBegin   = kQueryRows;
-        constexpr std::int32_t kGateBegin  = kKeyBegin + kKeyRows;
-        constexpr std::int32_t kValueBegin = kGateBegin + kGateRows;
-        const __nv_bfloat16 result_bf16    = __float2bfloat16_rn(result);
-
+        const __nv_bfloat16 result_bf16 = __float2bfloat16_rn(result);
         if (parent_row < kKeyBegin) {
             query[static_cast<std::int64_t>(token) * kQueryRows + parent_row] = result_bf16;
         } else if (parent_row < kGateBegin) {
             key[static_cast<std::int64_t>(token) * kKeyRows + parent_row - kKeyBegin] = result_bf16;
         } else if (parent_row < kValueBegin) {
-            gate[static_cast<std::int64_t>(token) * kGateRows + parent_row - kGateBegin] =
+            gate[static_cast<std::int64_t>(token) * kQueryRows + parent_row - kGateBegin] =
                 result_bf16;
         } else {
             value[static_cast<std::int64_t>(token) * kKeyRows + parent_row - kValueBegin] =
@@ -62,15 +64,15 @@ struct Nvfp4AttentionSmallTProductionSchedule {
                             Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
 };
 
-template <int ActiveTokens>
+template <class Geometry, int ActiveTokens>
 void launch_exact(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate, Tensor& k,
                   Tensor& v, cudaStream_t stream) {
-    using Geometry            = Nvfp4AttnInputGeometry;
+    using Output              = Nvfp4AttentionInputSmallTOutput<Geometry>;
     using Schedule            = typename Nvfp4AttentionSmallTProductionSchedule<ActiveTokens>::Type;
     constexpr int kTokenTiles = (ActiveTokens + Schedule::kTokenTile - 1) / Schedule::kTokenTile;
     constexpr int kBlocks     = (Geometry::kOutputRows / Schedule::kRowsPerCta) * kTokenTiles;
 
-    const Nvfp4AttentionInputSmallTOutput output{
+    const Output output{
         static_cast<__nv_bfloat16*>(q.data),
         static_cast<__nv_bfloat16*>(k.data),
         static_cast<__nv_bfloat16*>(gate.data),
@@ -86,20 +88,33 @@ void launch_exact(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <std::size_t... Offsets>
+template <class Geometry, std::size_t... Offsets>
 constexpr auto make_launchers(std::index_sequence<Offsets...>) {
     return std::array<Launch, sizeof...(Offsets)>{
-        &launch_exact<kNvfp4FirstSmallT + static_cast<int>(Offsets)>...};
+        &launch_exact<Geometry, kNvfp4FirstSmallT + static_cast<int>(Offsets)>...};
 }
 
-constexpr auto kLaunchers =
-    make_launchers(std::make_index_sequence<kNvfp4LastSmallT - kNvfp4FirstSmallT + 1>{});
+template <class Geometry>
+struct LauncherTable {
+    static constexpr auto kTable =
+        make_launchers<Geometry>(std::make_index_sequence<kNvfp4LastSmallT - kNvfp4FirstSmallT + 1>{});
+};
 
 } // namespace
 
 void nvfp4_attn_input_small_t_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                      Tensor& k, Tensor& v, cudaStream_t stream) {
-    kLaunchers[x.ne[1] - kNvfp4FirstSmallT](x, weight, q, gate, k, v, stream);
+    if (weight.n == Nvfp4AttnInputGeometry::kOutputRows) {
+        constexpr auto& table = LauncherTable<Nvfp4AttnInputGeometry>::kTable;
+        table[x.ne[1] - kNvfp4FirstSmallT](x, weight, q, gate, k, v, stream);
+        return;
+    }
+    if (weight.n == Nvfp4AttnInputShardGeometry::kOutputRows) {
+        constexpr auto& table = LauncherTable<Nvfp4AttnInputShardGeometry>::kTable;
+        table[x.ne[1] - kNvfp4FirstSmallT](x, weight, q, gate, k, v, stream);
+        return;
+    }
+    throw std::invalid_argument("nvfp4 attn_input small_t: unsupported weight rows");
 }
 
 } // namespace ninfer::ops::detail

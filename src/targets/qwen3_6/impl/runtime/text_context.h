@@ -1,4 +1,6 @@
 #pragma once
+#include <cstdlib>
+#include <string_view>
 #include "targets/qwen3_6/impl/runtime/instance.h"
 // Qwen3.6 family runtime implementation; instantiated only by exact variants.
 
@@ -43,15 +45,20 @@ struct ModelConfig {
     static constexpr int gdn_k_dim           = TextConfig::gdn_key_head_dim;
     static constexpr int gdn_v_heads         = TextConfig::gdn_value_heads;
     static constexpr int gdn_v_dim           = TextConfig::gdn_value_head_dim;
-    static constexpr int n_q                 = TextConfig::query_heads;
-    static constexpr int n_kv                = TextConfig::kv_heads;
+    // TP2 heads mode: runtime values so the schedule runs with per-rank head halves
+    // (12 q heads / 2 kv heads). All kCfg.n_q/n_kv consumers are runtime tensor views.
+    const int n_q;
+    const int n_kv;
+    const int q_size;
+    const int kv_size;
+    explicit ModelConfig(int q_heads, int kv_heads)
+        : n_q(q_heads), n_kv(kv_heads), q_size(q_heads * TextConfig::head_dim),
+          kv_size(kv_heads * TextConfig::head_dim) {}
     static constexpr int head_dim            = TextConfig::head_dim;
     static constexpr int rotary_dim          = TextConfig::rotary_dim;
     static constexpr int key_dim             = TextConfig::key_dim;
     static constexpr int value_dim           = TextConfig::value_dim;
     static constexpr int conv_dim            = TextConfig::convolution_dim;
-    static constexpr int q_size              = TextConfig::query_size;
-    static constexpr int kv_size             = TextConfig::kv_size;
     static constexpr int mtp_fc_in           = TextConfig::mtp_input_rows;
     static constexpr int mtp_attn_in         = TextConfig::mtp_attention_input_rows;
     static constexpr int mtp_mlp_gateup_rows = TextConfig::mtp_mlp_gate_up_rows;
@@ -74,7 +81,12 @@ struct ModelConfig {
     [[nodiscard]] static constexpr int gdn_idx(int layer) { return TextConfig::gdn_index(layer); }
 };
 
-inline constexpr ModelConfig kCfg{};
+inline int tp2_heads_div() {
+    const char* e = std::getenv("NINFER_TP2_SHARD");
+    return (e != nullptr && std::string_view(e) == "heads") ? 2 : 1;
+}
+inline const ModelConfig kCfg{TextConfig::query_heads / tp2_heads_div(),
+                              TextConfig::kv_heads / tp2_heads_div()};
 inline constexpr float kAttnScale                     = kAttentionScale;
 inline constexpr std::uint32_t kPrefillChunkAlignment = 128;
 

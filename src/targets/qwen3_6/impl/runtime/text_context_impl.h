@@ -373,53 +373,57 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
                                    Tensor& mtp_hidden) {
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
+    // The draft tower keeps the full 24/4 head set (its weights and KV pool are never sharded);
+    // kCfg.n_q/n_kv are runtime values that follow the TP2 heads mode and only apply to TEXT.
+    const int kMtpNQ  = TextConfig::query_heads;
+    const int kMtpNKV = TextConfig::kv_heads;
 
     const auto projection = workspace_recipe::mtp_attention_projection<TextConfig>(work_, T);
-    Tensor q              = projection.query.view({kCfg.head_dim, kCfg.n_q, T});
-    Tensor k              = projection.key.view({kCfg.head_dim, kCfg.n_kv, T});
-    Tensor gate           = projection.gate.view({kCfg.head_dim, kCfg.n_q, T});
-    Tensor v              = projection.value.view({kCfg.head_dim, kCfg.n_kv, T});
-    Tensor q_flat         = q.view({kCfg.q_size, T});
-    Tensor gate_flat      = gate.view({kCfg.q_size, T});
-    Tensor k_flat         = k.view({kCfg.kv_size, T});
-    Tensor v_flat         = v.view({kCfg.kv_size, T});
+    Tensor q              = projection.query.view({kCfg.head_dim, kMtpNQ, T});
+    Tensor k              = projection.key.view({kCfg.head_dim, kMtpNKV, T});
+    Tensor gate           = projection.gate.view({kCfg.head_dim, kMtpNQ, T});
+    Tensor v              = projection.value.view({kCfg.head_dim, kMtpNKV, T});
+    Tensor q_flat         = q.view({TextConfig::query_size, T});
+    Tensor gate_flat      = gate.view({TextConfig::query_size, T});
+    Tensor k_flat         = k.view({TextConfig::kv_size, T});
+    Tensor v_flat         = v.view({TextConfig::kv_size, T});
     Variant::mtp_attention_projection(ah, mtp_.payload->attention, q_flat, gate_flat, k_flat,
                                       v_flat, work_, s);
 
     const auto results = workspace_recipe::mtp_attention_results<TextConfig>(work_, T);
-    Tensor qn          = results.normalized_query.view({kCfg.head_dim, kCfg.n_q, T});
-    Tensor kn          = results.normalized_key.view({kCfg.head_dim, kCfg.n_kv, T});
+    Tensor qn          = results.normalized_query.view({kCfg.head_dim, kMtpNQ, T});
+    Tensor kn          = results.normalized_key.view({kCfg.head_dim, kMtpNKV, T});
     ops::rmsnorm(q, *mtp_.q_norm, kCfg.rms_eps, true, qn, s);
     ops::rmsnorm(k, *mtp_.k_norm, kCfg.rms_eps, true, kn, s);
     Tensor rope_for_op = active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions;
     ops::rope(rope_for_op, kCfg.rotary_dim, kCfg.rope_theta, qn, kn, s);
 
-    Tensor a = results.attention.view({kCfg.head_dim, kCfg.n_q, T});
+    Tensor a = results.attention.view({kCfg.head_dim, kMtpNQ, T});
     if (active_sequence_batch_ != 0) {
         const std::int32_t width = active_sequence_width_;
         if (width <= 0 || width * active_sequence_batch_ != T ||
             active_backend_kv_table_rows_ == nullptr || active_valid_columns_ == nullptr) {
             throw std::logic_error("MTP sequence batch binding is incomplete");
         }
-        Tensor q_batch        = qn.view({kCfg.head_dim, kCfg.n_q, width, active_sequence_batch_});
-        Tensor k_batch        = kn.view({kCfg.head_dim, kCfg.n_kv, width, active_sequence_batch_});
-        Tensor v_batch        = v.view({kCfg.head_dim, kCfg.n_kv, width, active_sequence_batch_});
-        Tensor a_batch        = a.view({kCfg.head_dim, kCfg.n_q, width, active_sequence_batch_});
+        Tensor q_batch        = qn.view({kCfg.head_dim, kMtpNQ, width, active_sequence_batch_});
+        Tensor k_batch        = kn.view({kCfg.head_dim, kMtpNKV, width, active_sequence_batch_});
+        Tensor v_batch        = v.view({kCfg.head_dim, kMtpNKV, width, active_sequence_batch_});
+        Tensor a_batch        = a.view({kCfg.head_dim, kMtpNQ, width, active_sequence_batch_});
         Tensor position_batch = positions.view({width, active_sequence_batch_});
         ops::causal_softmax_attention(
             q_batch, k_batch, v_batch, position_batch, *active_valid_columns_,
-            *active_backend_kv_table_rows_, {kCfg.head_dim, kCfg.n_q, kCfg.n_kv}, kAttnScale,
+            *active_backend_kv_table_rows_, {kCfg.head_dim, kMtpNQ, kMtpNKV}, kAttnScale,
             batch_mtp_kv_->batch_layer_view(0), envelope, work_, a_batch, s);
     } else {
         ops::causal_softmax_attention(qn, kn, v, positions, Tensor{}, io_.backend_kv_table_row,
-                                      {kCfg.head_dim, kCfg.n_q, kCfg.n_kv}, kAttnScale,
+                                      {kCfg.head_dim, kMtpNQ, kMtpNKV}, kAttnScale,
                                       batch_mtp_kv_->batch_layer_view(0), envelope, work_, a, s);
     }
     ops::sigmoid_mul(gate, a, s);
 
     const auto post = workspace_recipe::mtp_post_attention<TextConfig>(work_, T);
     Tensor o        = post.output;
-    ops::linear(a.view({kCfg.q_size, T}), *mtp_.o_proj, o, s);
+    ops::linear(a.view({TextConfig::query_size, T}), *mtp_.o_proj, o, s);
     ops::residual_add(o, x, s);
 
     Tensor mh = post.post_mixer_hidden;
@@ -495,12 +499,12 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
         Tensor ah;
         mtp_forward_stem(ids, hidden, input_embeddings, x, ah);
 
-        Tensor k_flat = work_.alloc(DType::BF16, {kCfg.kv_size, T});
-        Tensor v_flat = work_.alloc(DType::BF16, {kCfg.kv_size, T});
+        Tensor k_flat = work_.alloc(DType::BF16, {TextConfig::kv_size, T});
+        Tensor v_flat = work_.alloc(DType::BF16, {TextConfig::kv_size, T});
         Variant::mtp_kv_projection(ah, mtp_.payload->attention, k_flat, v_flat, work_, s);
-        Tensor k  = k_flat.view({kCfg.head_dim, kCfg.n_kv, T});
-        Tensor v  = v_flat.view({kCfg.head_dim, kCfg.n_kv, T});
-        Tensor kn = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_kv, T});
+        Tensor k  = k_flat.view({kCfg.head_dim, TextConfig::kv_heads, T});
+        Tensor v  = v_flat.view({kCfg.head_dim, TextConfig::kv_heads, T});
+        Tensor kn = work_.alloc(DType::BF16, {kCfg.head_dim, TextConfig::kv_heads, T});
         ops::rmsnorm(k, *mtp_.k_norm, kCfg.rms_eps, true, kn, s);
         ops::rope(rope_positions, kCfg.rotary_dim, kCfg.rope_theta, kn, s);
         ops::kv_cache_append(kn, v, positions, mtp_kv_.layer_view(0), s);
@@ -520,13 +524,13 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
     }
 
     if (final_chunk) {
-        Tensor q_flat    = work_.alloc(DType::BF16, {kCfg.q_size, 1});
-        Tensor gate_flat = work_.alloc(DType::BF16, {kCfg.q_size, 1});
+        Tensor q_flat    = work_.alloc(DType::BF16, {TextConfig::query_size, 1});
+        Tensor gate_flat = work_.alloc(DType::BF16, {TextConfig::query_size, 1});
         Variant::mtp_q_gate_projection(ah_last, mtp_.payload->attention, q_flat, gate_flat, work_,
                                        s);
-        Tensor q    = q_flat.view({kCfg.head_dim, kCfg.n_q, 1});
-        Tensor gate = gate_flat.view({kCfg.head_dim, kCfg.n_q, 1});
-        Tensor qn   = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_q, 1});
+        Tensor q    = q_flat.view({kCfg.head_dim, TextConfig::query_heads, 1});
+        Tensor gate = gate_flat.view({kCfg.head_dim, TextConfig::query_heads, 1});
+        Tensor qn   = work_.alloc(DType::BF16, {kCfg.head_dim, TextConfig::query_heads, 1});
         ops::rmsnorm(q, *mtp_.q_norm, kCfg.rms_eps, true, qn, s);
         Tensor last_position = positions.slice(0, T - 1, 1);
         Tensor last_rope_position;
@@ -544,14 +548,16 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
         }
         ops::rope(last_rope_position, kCfg.rotary_dim, kCfg.rope_theta, qn, s);
 
-        Tensor a = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_q, 1});
+        Tensor a = work_.alloc(DType::BF16, {kCfg.head_dim, TextConfig::query_heads, 1});
         ops::causal_softmax_attention_cached(qn, last_position,
-                                             {kCfg.head_dim, kCfg.n_q, kCfg.n_kv}, kAttnScale,
+                                             {kCfg.head_dim, TextConfig::query_heads,
+                                              TextConfig::kv_heads},
+                                             kAttnScale,
                                              mtp_kv_.layer_view(0), envelope, work_, a, s);
         ops::sigmoid_mul(gate, a, s);
 
         Tensor o = work_.alloc(DType::BF16, {kCfg.hidden, 1});
-        ops::linear(a.view({kCfg.q_size, 1}), *mtp_.o_proj, o, s);
+        ops::linear(a.view({TextConfig::query_size, 1}), *mtp_.o_proj, o, s);
         ops::residual_add(o, x_last, s);
 
         Tensor mh = work_.alloc(DType::BF16, {kCfg.hidden, 1});

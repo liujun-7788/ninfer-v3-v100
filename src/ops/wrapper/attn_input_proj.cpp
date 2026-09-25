@@ -14,6 +14,8 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <atomic>
+#include <cstdio>
 
 namespace ninfer::ops {
 namespace {
@@ -26,7 +28,12 @@ void require_matrix(const Tensor& tensor, std::int32_t rows, std::int32_t cols, 
     if (tensor.dtype != DType::BF16 || tensor.ne[0] != rows || tensor.ne[1] != cols ||
         tensor.ne[2] != 1 || tensor.ne[3] != 1 || !tensor.is_contiguous() ||
         !aligned_to(tensor.data, 16)) {
-        throw std::invalid_argument(std::string("attn_input_proj: invalid ") + label);
+        throw std::invalid_argument(
+            std::string("attn_input_proj: invalid ") + label + " [want " + std::to_string(rows) +
+            "x" + std::to_string(cols) + " got " + std::to_string(tensor.ne[0]) + "x" +
+            std::to_string(tensor.ne[1]) + "x" + std::to_string(tensor.ne[2]) + "x" +
+            std::to_string(tensor.ne[3]) + " dt=" + std::to_string(static_cast<int>(tensor.dtype)) +
+            (tensor.is_contiguous() ? "" : " noncontig") + "]");
     }
 }
 
@@ -107,22 +114,28 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
     }
 
     if (weight.qtype == QType::NVFP4) {
-        constexpr std::int32_t kHidden = 5120;
-        constexpr std::int32_t kQRows  = 6144;
-        constexpr std::int32_t kKvRows = 1024;
-        constexpr std::int32_t kRows   = 14336;
-        const std::int32_t cols        = x.ne[1];
+        constexpr std::int32_t kHidden    = 5120;
+        constexpr std::int32_t kFullRows  = 14336;
+        constexpr std::int32_t kShardRows = 7168;
+        const std::int32_t cols           = x.ne[1];
         if (cols <= 0) { throw std::invalid_argument("attn_input_proj: T must be positive"); }
         if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4) {
             throw std::invalid_argument("NVFP4 attn_input_proj admits only A16 or A4");
         }
+        if (weight.n != kFullRows && weight.n != kShardRows) {
+            throw std::invalid_argument("nvfp4 attn_input_proj: unsupported weight shape");
+        }
+        // Fused row order q | key | gate | value; the TP2 head-split shard keeps the same
+        // proportions (q/gate 3/14 of the parent rows, k/v 1/14 each).
+        const std::int32_t kQRows  = weight.n * 3 / 7;
+        const std::int32_t kKvRows = weight.n / 14;
         require_matrix(x, kHidden, cols, "x");
         require_matrix(q, kQRows, cols, "q");
         require_matrix(gate, kQRows, cols, "gate");
         require_matrix(k, kKvRows, cols, "k");
         require_matrix(v, kKvRows, cols, "v");
         detail::validate_nvfp4_weight(weight, "nvfp4 attn_input_proj");
-        if (weight.n != kRows || weight.k != kHidden) {
+        if (weight.k != kHidden) {
             throw std::invalid_argument("nvfp4 attn_input_proj: unsupported weight shape");
         }
         detail::nvfp4_attn_input_dispatch(x, weight, q, gate, k, v, policy, workspace, stream);
@@ -130,22 +143,28 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
     }
 
     if (weight.qtype == QType::FP8_E4M3FN_ROW_BF16S) {
-        constexpr std::int32_t kHidden = 5120;
-        constexpr std::int32_t kQRows  = 6144;
-        constexpr std::int32_t kKvRows = 1024;
-        constexpr std::int32_t kRows   = 14336;
-        const std::int32_t cols        = x.ne[1];
+        constexpr std::int32_t kHidden    = 5120;
+        constexpr std::int32_t kFullRows  = 14336;
+        constexpr std::int32_t kShardRows = 7168;
+        const std::int32_t cols           = x.ne[1];
         if (cols <= 0) { throw std::invalid_argument("attn_input_proj: T must be positive"); }
         if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA8) {
             throw std::invalid_argument("FP8 attn_input_proj admits only A16 or A8");
         }
+        if (weight.n != kFullRows && weight.n != kShardRows) {
+            throw std::invalid_argument("fp8 attn_input_proj: unsupported weight shape");
+        }
+        // Fused row order q | key | gate | value; the TP2 head-split shard keeps the same
+        // proportions (q/gate 3/14 of the parent rows, k/v 1/14 each).
+        const std::int32_t kQRows  = weight.n * 3 / 7;
+        const std::int32_t kKvRows = weight.n / 14;
         require_matrix(x, kHidden, cols, "x");
         require_matrix(q, kQRows, cols, "q");
         require_matrix(gate, kQRows, cols, "gate");
         require_matrix(k, kKvRows, cols, "k");
         require_matrix(v, kKvRows, cols, "v");
         detail::validate_fp8_weight(weight, "fp8 attn_input_proj");
-        if (weight.n != kRows || weight.k != kHidden) {
+        if (weight.k != kHidden) {
             throw std::invalid_argument("fp8 attn_input_proj: unsupported weight shape");
         }
         detail::fp8_attn_input_dispatch(x, weight, q, gate, k, v, policy, workspace, stream);
@@ -188,14 +207,16 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
         }
         return 0;
     case QType::NVFP4:
-        if (parent_rows != detail::Nvfp4AttnInputGeometry::kOutputRows ||
+        if ((parent_rows != detail::Nvfp4AttnInputGeometry::kOutputRows &&
+             parent_rows != detail::Nvfp4AttnInputShardGeometry::kOutputRows) ||
             input_rows != detail::Nvfp4AttnInputGeometry::kInputRows ||
             (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4)) {
             throw std::invalid_argument("attn_input_proj workspace: unsupported NVFP4 profile");
         }
         return detail::nvfp4_attn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens);
     case QType::FP8_E4M3FN_ROW_BF16S:
-        if (parent_rows != detail::Fp8AttnInputGeometry::kOutputRows ||
+        if ((parent_rows != detail::Fp8AttnInputGeometry::kOutputRows &&
+             parent_rows != detail::Fp8AttnInputShardGeometry::kOutputRows) ||
             input_rows != detail::Fp8AttnInputGeometry::kInputRows) {
             throw std::invalid_argument("attn_input_proj workspace: unsupported FP8 profile");
         }

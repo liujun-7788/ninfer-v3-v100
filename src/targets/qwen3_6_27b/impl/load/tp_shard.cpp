@@ -406,23 +406,24 @@ void tp_shard_model(RuntimeModelView& runtime, int rank) {
     const bool shard_heads = shard_mode == "heads";
     if (shard_heads) {
         // Attention head-split (weights only; the head-offset forward is a separate change).
-        // Fused QKV [14336] = q[6144] | gate[6144] | k[1024] | v[1024]; rank r keeps the
-        // r-th half of every segment -> 7168 rows. Segments are 512-row aligned, so NVFP4
-        // scale blocks (128-row granularity) move as whole units.
+        // Fused QKV [14336] = q[0:6144] | key[6144:7168] | gate[7168:13312] | value[13312:14336]
+        // (row order per the decode kernel's store ranges); rank r keeps the r-th half of every
+        // segment -> 7168 rows. Segments are 512-row aligned, so NVFP4 scale blocks (128-row
+        // granularity) move as whole units.
         for (FullAttentionWeights& layer : runtime.full_layers) {
             Weight& qkv = std::get<FusedAttentionProjectionPayload>(layer.projection)
                               .query_key_gate_value;
-            const std::int64_t base = rank * 3072;
-            const std::int64_t kvb  = rank * 512;
+            const std::int64_t q_off  = rank * 3072;
+            const std::int64_t kv_off = rank * 512;
             const std::vector<Segment> qkv_segs = {
-                Segment{static_cast<std::int32_t>(base), 3072, 0},
-                Segment{static_cast<std::int32_t>(6144 + base), 3072, 3072},
-                Segment{static_cast<std::int32_t>(12288 + kvb), 512, 6144},
-                Segment{static_cast<std::int32_t>(13312 + kvb), 512, 6656},
+                Segment{static_cast<std::int32_t>(q_off), 3072, 0},
+                Segment{static_cast<std::int32_t>(6144 + kv_off), 512, 3072},
+                Segment{static_cast<std::int32_t>(7168 + q_off), 3072, 3584},
+                Segment{static_cast<std::int32_t>(13312 + kv_off), 512, 6656},
             };
             shard_rows(qkv, rank, qkv_segs, 7168, "attention qkv head-split");
-            shard_elementwise_half(layer.query_norm, rank, "query_norm");
-            shard_elementwise_half(layer.key_norm, rank, "key_norm");
+            // query_norm/key_norm are per-head-dim weights (head_dim elements, shared across
+            // heads) -- they do NOT scale with head count and must stay full.
             shard_columns(layer.output, rank, 3072, scratch, kStagingBytes,
                           "attention output");
             prepack_sharded(layer.output, false);

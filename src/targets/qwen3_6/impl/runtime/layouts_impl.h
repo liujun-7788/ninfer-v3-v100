@@ -1,4 +1,5 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
+#include "targets/qwen3_6/impl/runtime/text_context.h"
 #include "targets/qwen3_6/impl/runtime/layouts.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include "targets/qwen3_6/impl/runtime/workspace_recipe.h"
@@ -119,7 +120,8 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      .full_attention_layers     = TextConfig::full_attention_layers(),
                      .mtp_layers                = TextConfig::mtp_layers,
                      .capacity                  = plan.capacity,
-                     .kv_heads                  = TextConfig::kv_heads,
+                     .kv_heads                  = schedule::kCfg.n_kv,
+                     .mtp_kv_heads              = TextConfig::kv_heads,
                      .attention_head_dim        = TextConfig::head_dim,
                      .kv_storage                = plan.kv_storage,
                      .enable_mtp                = plan.features.mtp(),
@@ -292,7 +294,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                                                                phase, first, last));
         (void)workspace_recipe::text_attention_results<TextConfig>(layout, last);
         scratch(layout, ops::causal_softmax_attention_workspace_capacity_bytes(
-                            {TextConfig::head_dim, TextConfig::query_heads, TextConfig::kv_heads},
+                            {TextConfig::head_dim, schedule::kCfg.n_q, schedule::kCfg.n_kv},
                             plan.kv_storage, envelope, batch_size, min_width, max_width));
         scratch(layout, Variant::attention_output_projection_workspace_capacity_bytes(
                             plan.weights_profile, phase, first, last));

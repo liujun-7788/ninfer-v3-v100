@@ -5,6 +5,7 @@
 
 #include "core/arena.h"
 #include "core/layout.h"
+#include "targets/qwen3_6/impl/runtime/text_context.h"
 
 #include <cstdint>
 
@@ -57,12 +58,16 @@ struct TextAttentionProjectionRoots {
 
 template <class Config, class Allocator>
 TextAttentionProjectionRoots text_attention_projection(Allocator& allocator, std::int32_t tokens) {
+    // Row counts follow the runtime head configuration (TP2 heads mode halves them); the plan
+    // builder and the runtime schedule share this function, so both sides always agree.
+    const int q_rows = schedule::kCfg.n_q * Config::head_dim;
+    const int kv_rows = schedule::kCfg.n_kv * Config::head_dim;
     return {
         matrix(allocator, DType::BF16, Config::hidden, tokens),
-        matrix(allocator, DType::BF16, Config::query_size, tokens),
-        matrix(allocator, DType::BF16, Config::query_size, tokens),
-        matrix(allocator, DType::BF16, Config::kv_size, tokens),
-        matrix(allocator, DType::BF16, Config::kv_size, tokens),
+        matrix(allocator, DType::BF16, q_rows, tokens),
+        matrix(allocator, DType::BF16, q_rows, tokens),
+        matrix(allocator, DType::BF16, kv_rows, tokens),
+        matrix(allocator, DType::BF16, kv_rows, tokens),
     };
 }
 
@@ -74,10 +79,12 @@ struct TextAttentionResultRoots {
 
 template <class Config, class Allocator>
 TextAttentionResultRoots text_attention_results(Allocator& allocator, std::int32_t tokens) {
+    const int q_rows = schedule::kCfg.n_q * Config::head_dim;
+    const int kv_rows = schedule::kCfg.n_kv * Config::head_dim;
     return {
-        matrix(allocator, DType::BF16, Config::query_size, tokens),
-        matrix(allocator, DType::BF16, Config::kv_size, tokens),
-        matrix(allocator, DType::BF16, Config::query_size, tokens),
+        matrix(allocator, DType::BF16, q_rows, tokens),
+        matrix(allocator, DType::BF16, kv_rows, tokens),
+        matrix(allocator, DType::BF16, q_rows, tokens),
     };
 }
 

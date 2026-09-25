@@ -17,7 +17,7 @@ void launch_fp8_attn_input_volta_qpn(const Tensor& x, const Weight& weight, Tens
     const Fp8AttentionInputOutput output{static_cast<__nv_bfloat16*>(query.data),
                                          static_cast<__nv_bfloat16*>(key.data),
                                          static_cast<__nv_bfloat16*>(gate.data),
-                                         static_cast<__nv_bfloat16*>(value.data)};
+                                         static_cast<__nv_bfloat16*>(value.data), weight.n};
     if (x_fp16 != nullptr) {
         launch_fp8_volta_qpn_with_fp16_activation(
             x, weight, static_cast<const half*>(x_fp16), output, weight.n, stream);

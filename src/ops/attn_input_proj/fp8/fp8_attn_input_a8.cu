@@ -13,16 +13,12 @@
 namespace ninfer::ops::detail {
 namespace {
 
-using Geometry = Fp8AttnInputGeometry;
-using Schedule = typename Fp8LinearA8ProductionSchedule<Geometry>::Type;
-
-static_assert((kFp8AttnInputQueryRows % Schedule::kBlockRows) == 0);
-static_assert((kFp8AttnInputKeyRows % Schedule::kBlockRows) == 0);
-static_assert((kFp8AttnInputGateRows % Schedule::kBlockRows) == 0);
-
-template <bool FullTokens>
+template <class Geometry, bool FullTokens>
 void launch_mma(const Weight& weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
                 Fp8A8Workspace workspace, std::int32_t tokens, cudaStream_t stream) {
+    using Schedule = typename Fp8LinearA8ProductionSchedule<Geometry>::Type;
+    static_assert(((Geometry::kOutputRows * 3 / 7) % Schedule::kBlockRows) == 0 &&
+                  ((Geometry::kOutputRows / 14) % Schedule::kBlockRows) == 0);
     constexpr int kRowTiles = Geometry::kOutputRows / Schedule::kBlockRows;
     const int token_tiles   = (tokens + Schedule::kBlockTokens - 1) / Schedule::kBlockTokens;
     const int blocks        = kRowTiles * token_tiles;
@@ -31,6 +27,7 @@ void launch_mma(const Weight& weight, Tensor& q, Tensor& gate, Tensor& k, Tensor
         static_cast<__nv_bfloat16*>(k.data),
         static_cast<__nv_bfloat16*>(gate.data),
         static_cast<__nv_bfloat16*>(v.data),
+        Geometry::kOutputRows,
     };
 
     if constexpr (Schedule::kSharedBytes > 48 * 1024) {
@@ -48,16 +45,27 @@ void launch_mma(const Weight& weight, Tensor& q, Tensor& gate, Tensor& k, Tensor
     CUDA_CHECK(cudaGetLastError());
 }
 
+template <class Geometry>
+void launch_for(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
+                Fp8A8Workspace workspace, cudaStream_t stream) {
+    using Schedule = typename Fp8LinearA8ProductionSchedule<Geometry>::Type;
+    launch_fp8_a8_quantize(x, weight, workspace, stream);
+    if ((x.ne[1] % Schedule::kBlockTokens) == 0) {
+        launch_mma<Geometry, true>(weight, q, gate, k, v, workspace, x.ne[1], stream);
+    } else {
+        launch_mma<Geometry, false>(weight, q, gate, k, v, workspace, x.ne[1], stream);
+    }
+}
+
 } // namespace
 
 void fp8_attn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                               Tensor& k, Tensor& v, Fp8A8Workspace workspace, cudaStream_t stream) {
-    launch_fp8_a8_quantize(x, weight, workspace, stream);
-    if ((x.ne[1] % Schedule::kBlockTokens) == 0) {
-        launch_mma<true>(weight, q, gate, k, v, workspace, x.ne[1], stream);
-    } else {
-        launch_mma<false>(weight, q, gate, k, v, workspace, x.ne[1], stream);
+    if (weight.n == Fp8AttnInputShardGeometry::kOutputRows) {
+        launch_for<Fp8AttnInputShardGeometry>(x, weight, q, gate, k, v, workspace, stream);
+        return;
     }
+    launch_for<Fp8AttnInputGeometry>(x, weight, q, gate, k, v, workspace, stream);
 }
 
 } // namespace ninfer::ops::detail

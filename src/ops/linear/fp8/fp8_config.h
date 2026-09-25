@@ -405,6 +405,19 @@ struct Fp8LinearSmallTProductionSchedule<Fp8AttnInputGeometry, ActiveTokens> {
                           Fp8SmallTBlockOrder::RowsContiguous, 1>;
 };
 
+// TP2 shard geometry inherits the fused attention problem's schedule.
+template <int ActiveTokens>
+struct Fp8LinearSmallTProductionSchedule<Fp8AttnInputShardGeometry, ActiveTokens> {
+    static_assert(ActiveTokens >= kFp8FirstSmallT);
+    static_assert(ActiveTokens <= kFp8LinearSmallTMax<Fp8AttnInputShardGeometry>);
+    static constexpr auto kActivationAccess = ActiveTokens >= 3 && ActiveTokens <= 4
+                                                  ? Fp8SmallTActivationAccess::SharedPhase
+                                                  : Fp8SmallTActivationAccess::TokenPacked;
+    using Type =
+        Fp8SmallTSchedule<8, 2, 16, ActiveTokens, 1, kActivationAccess, Fp8CodeCache::Default, 1,
+                          Fp8SmallTBlockOrder::RowsContiguous, 1>;
+};
+
 template <int ActiveTokens>
 struct Fp8LinearSmallTProductionSchedule<Fp8GdnInputGeometry, ActiveTokens> {
     static_assert(ActiveTokens >= kFp8FirstSmallT);

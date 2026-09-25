@@ -24,5 +24,7 @@ struct CausalAttentionGeometry : AttentionHeadMapping<QHeadsValue, KVHeadsValue>
 
 using CausalD256H24Kv4 = CausalAttentionGeometry<24, 4, 1>;
 using CausalD256H16Kv2 = CausalAttentionGeometry<16, 2, 2>;
+// TP2 heads mode: each rank owns half of the 24/4 GQA geometry (same GroupSize 6).
+using CausalD256H12Kv2 = CausalAttentionGeometry<12, 2, 1>;
 
 } // namespace ninfer::ops

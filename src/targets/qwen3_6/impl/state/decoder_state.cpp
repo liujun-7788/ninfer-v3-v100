@@ -65,7 +65,8 @@ DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderState
                                 spec.attention_head_dim, spec.kv_storage, spec.kv_table_rows,
                                 spec.text_physical_page_groups);
     if (spec.enable_mtp) {
-        layout.mtp_kv = plan_cache(builder, spec.mtp_layers, spec.capacity, spec.kv_heads,
+        const std::int32_t mtp_kv_heads = spec.mtp_kv_heads != 0 ? spec.mtp_kv_heads : spec.kv_heads;
+        layout.mtp_kv = plan_cache(builder, spec.mtp_layers, spec.capacity, mtp_kv_heads,
                                    spec.attention_head_dim, spec.kv_storage, spec.kv_table_rows,
                                    spec.mtp_physical_page_groups);
     }

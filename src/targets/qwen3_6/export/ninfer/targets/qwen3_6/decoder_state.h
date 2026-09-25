@@ -17,6 +17,8 @@ struct DecoderStateSpec {
     std::uint32_t mtp_layers                = 0;
     std::uint32_t capacity                  = 0;
     std::int32_t kv_heads                   = 0;
+    // MTP draft keeps the full (unsharded) head set; 0 falls back to kv_heads.
+    std::int32_t mtp_kv_heads               = 0;
     std::int32_t attention_head_dim         = 0;
     KvCacheStorage kv_storage               = KvCacheStorage::BFloat16;
     bool enable_mtp                         = false;
