@@ -2,7 +2,6 @@
 
 #include "artifact/binder.h"
 #include "core/pp_link.h"
-#include "core/tp_group.h"
 #include "artifact/materializer.h"
 #include "artifact/reader.h"
 #include "core/device.h"
@@ -15,7 +14,6 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <type_traits>
 #include <utility>
 
 namespace ninfer::targets {
@@ -86,29 +84,6 @@ void validate_options(const EngineOptions& options) {
             options.context_cache.host_kv_capacity_bytes != 0) {
             throw std::invalid_argument(
                 "Engine pipeline mode does not support host KV/state offload yet");
-        }
-    }
-    if (!options.tp_devices.empty()) {
-        if (options.tp_devices.size() != 2) {
-            throw std::invalid_argument("Engine tensor parallel requires exactly two devices");
-        }
-        if (options.tp_devices[0] != options.device) {
-            throw std::invalid_argument("Engine tensor parallel first device must match device");
-        }
-        if (options.tp_devices[0] == options.tp_devices[1]) {
-            throw std::invalid_argument("Engine tensor parallel devices must be distinct");
-        }
-        if (!options.pp_devices.empty()) {
-            throw std::invalid_argument(
-                "Engine tensor parallel and pipeline parallel are mutually exclusive");
-        }
-        if (options.enable_vision) {
-            throw std::invalid_argument("Engine tensor parallel does not support Vision yet");
-        }
-        if (options.context_cache.host_state_slots != 0 ||
-            options.context_cache.host_kv_capacity_bytes != 0) {
-            throw std::invalid_argument(
-                "Engine tensor parallel does not support host KV/state offload yet");
         }
     }
 }
@@ -182,9 +157,6 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
         pipeline = std::make_unique<PpLink>(device, peer_devices);
         for (std::size_t s = 1; s < options.pp_devices.size(); ++s) {
             DeviceContext& peer = pipeline->rank(s);
-            // PpLink construction leaves the current device on the last peer; each
-            // peer load must run in the peer context or CUDA handles cross over.
-            peer.bind_to_current_thread();
             artifact::Binder binder_s(reader);
             auto load_plan_s = Target::plan_load(binder_s, options, weights_profile);
             auto materialized_s = artifact::materialize(reader, load_plan_s.materialization(),
@@ -192,34 +164,6 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
             stage_models.push_back(
                 Target::construct_loaded_model(std::move(load_plan_s), std::move(materialized_s)));
             peer.synchronize();
-        }
-        device.bind_to_current_thread();
-    }
-
-    std::unique_ptr<TpGroup> tp;
-    if (!options.tp_devices.empty()) {
-        if constexpr (requires {
-                          Target::tp_shard_loaded_model(*model, std::declval<TpGroup&>(), 0);
-                      }) {
-            tp = std::make_unique<TpGroup>(device, options.tp_devices[1]);
-            DeviceContext& peer = tp->rank(1);
-            // TpGroup construction leaves the current device on the peer; the peer's
-            // full weight copy must load in the peer context or CUDA handles cross over.
-            peer.bind_to_current_thread();
-            artifact::Binder binder_tp(reader);
-            auto load_plan_tp = Target::plan_load(binder_tp, options, weights_profile);
-            auto materialized_tp = artifact::materialize(reader, load_plan_tp.materialization(),
-                                                          peer, &options.startup_observer);
-            auto peer_model = Target::construct_loaded_model(std::move(load_plan_tp),
-                                                             std::move(materialized_tp));
-            Target::tp_shard_loaded_model(*peer_model, *tp, 1);
-            peer.synchronize();
-            stage_models.push_back(std::move(peer_model));
-            device.bind_to_current_thread();
-            Target::tp_shard_loaded_model(*model, *tp, 0);
-            device.synchronize();
-        } else {
-            throw std::invalid_argument("this target does not support tensor parallel");
         }
     }
 
@@ -231,7 +175,7 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     auto instance =
         std::make_unique<Instance>(std::move(loaded), capacity_resolution, std::move(sequence_plan),
                                    device, options.startup_observer, std::move(pipeline),
-                                   std::move(tp), std::move(stage_models));
+                                   std::move(stage_models));
     device.synchronize();
     program_phase.complete();
     instance->kv_capacity_resolution.available_after_startup_bytes = current_free_device_bytes();
@@ -268,10 +212,9 @@ Qwen3_6_27BInstance::Qwen3_6_27BInstance(std::unique_ptr<LoadedQwen3_6_27B> stab
                                          DeviceContext& device,
                                          const StartupObserver& startup_observer,
                                          std::unique_ptr<PpLink> pipeline,
-                                         std::unique_ptr<TpGroup> tp_link,
                                          std::vector<std::unique_ptr<Qwen3_6_27B::LoadedModel>> stage_models)
     : loaded(std::move(stable_loaded)), kv_capacity_resolution(resolution),
-      capacity(sequence_plan.capacity()), pp(std::move(pipeline)), tp(std::move(tp_link)),
+      capacity(sequence_plan.capacity()), pp(std::move(pipeline)),
       stage_models(std::move(stage_models)),
       program([&] {
           std::vector<const Qwen3_6_27B::LoadedModel*> views;
@@ -279,9 +222,7 @@ Qwen3_6_27BInstance::Qwen3_6_27BInstance(std::unique_ptr<LoadedQwen3_6_27B> stab
           for (const auto& model : this->stage_models) { views.push_back(model.get()); }
           return Qwen3_6_27B::create_program(
               *loaded->model, std::move(sequence_plan), device, startup_observer,
-              Qwen3_6_27B::ProgramPipeline{.pp = pp.get(),
-                                           .tp = tp.get(),
-                                           .stage_models = std::move(views)});
+              Qwen3_6_27B::ProgramPipeline{.pp = pp.get(), .stage_models = std::move(views)});
       }()) {}
 
 Qwen3_6_27BInstance::~Qwen3_6_27BInstance() = default;
@@ -298,7 +239,6 @@ Qwen3_6_35BA3BInstance::Qwen3_6_35BA3BInstance(std::unique_ptr<LoadedQwen3_6_35B
                                                DeviceContext& device,
                                                const StartupObserver& startup_observer,
                                                std::unique_ptr<PpLink>,
-                                               std::unique_ptr<TpGroup>,
                                                std::vector<std::unique_ptr<Qwen3_6_35BA3B::LoadedModel>>)
     : loaded(std::move(stable_loaded)), kv_capacity_resolution(resolution),
       capacity(sequence_plan.capacity()),

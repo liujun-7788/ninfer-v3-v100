@@ -237,10 +237,9 @@ void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor&
     }
     case Nvfp4LinearSwiGluRoute::VoltaCutlass: {
         auto scope = workspace.scope();
-        Tensor projected = workspace.alloc(
-            DType::BF16, {Nvfp4MlpGateUpGeometry::kOutputRows, x.ne[1]}, 256);
+        Tensor projected = workspace.alloc(DType::BF16, {weight.n, x.ne[1]}, 256);
         nvfp4_cutlass_sm70_launch(x, weight, projected, workspace, stream);
-        constexpr std::int32_t kIntermediate = Nvfp4MlpGateUpGeometry::kOutputRows / 2;
+        const std::int32_t kIntermediate = weight.n / 2;
         silu_mul(projected.slice(0, 0, kIntermediate),
                  projected.slice(0, kIntermediate, kIntermediate), out, stream);
         return;

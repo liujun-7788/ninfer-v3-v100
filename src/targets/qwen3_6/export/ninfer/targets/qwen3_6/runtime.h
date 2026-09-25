@@ -21,6 +21,7 @@ struct DeviceContext;
 namespace ninfer {
 
 class PpLink;
+class TpGroup;
 
 } // namespace ninfer
 
@@ -835,9 +836,12 @@ struct ReleaseResult {
 // Pipeline handoff for two-rank layer-parallel execution. When pp is set, ProgramImplCore
 // builds a mirror physical store set on the peer device and executes the model layer range
 // split across ranks; rank1_model is the second full model view loaded on the peer device.
+// When tp is set instead, the model runs data-sharded on both ranks with allreduce after
+// each sharded projection; stage_models is unused in that mode.
 template <class Variant>
 struct ProgramPipelineSeed {
     PpLink* pp                                     = nullptr;
+    TpGroup* tp                                    = nullptr;
     std::vector<const typename Variant::ModelView*> stage_models;  // stages 1..N-1, in order
 };
 

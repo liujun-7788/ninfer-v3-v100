@@ -43,6 +43,7 @@ struct ServeOptions {
     std::size_t response_store_max_bytes   = kDefaultResponseStoreBytes;
     int device                    = 0;
     std::vector<int> pp_devices;
+    std::vector<int> tp_devices;
     KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     ContextCacheOptions context_cache;

@@ -12,6 +12,7 @@
 namespace ninfer {
 
 struct DeviceContext;
+class TpGroup;
 
 namespace artifact {
 class Binder;
@@ -137,8 +138,12 @@ struct Package {
                                                                WeightsProfile weights_profile);
     struct ProgramPipeline {
         ninfer::PpLink* pp                   = nullptr;
+        ninfer::TpGroup* tp                  = nullptr;
         std::vector<const LoadedModel*> stage_models;  // stages 1..N-1, in order
     };
+    // Compacts every TP-shardable weight of the loaded model in place for the given
+    // rank of the group. The model must have been constructed on its owning device.
+    static void tp_shard_loaded_model(const LoadedModel& model, TpGroup& tp, int rank);
     [[nodiscard]] static std::unique_ptr<Program>
     create_program(const LoadedModel& model, SequencePlan&& plan, DeviceContext& device,
                    const StartupObserver& startup_observer,

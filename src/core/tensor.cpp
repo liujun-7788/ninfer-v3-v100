@@ -4,6 +4,9 @@
 #include <limits>
 #include <stdexcept>
 
+#include <execinfo.h>
+#include <unistd.h>
+
 namespace ninfer {
 namespace {
 
@@ -101,6 +104,14 @@ Tensor Tensor::view(std::initializer_list<std::int32_t> shape) const {
 
     const auto normalized = normalize_shape(shape);
     if (shape_numel(normalized) != numel()) {
+        std::fprintf(stderr,
+                     "[VIEW-MISMATCH] requested={%d,%d,%d,%d} req_numel=%lld actual={%d,%d,%d,%d} act_numel=%lld\n",
+                     normalized[0], normalized[1], normalized[2], normalized[3],
+                     static_cast<long long>(shape_numel(normalized)),
+                     ne[0], ne[1], ne[2], ne[3], static_cast<long long>(numel()));
+        void* frames[32];
+        const int n = backtrace(frames, 32);
+        backtrace_symbols_fd(frames, n, STDERR_FILENO);
         throw std::invalid_argument("view element count mismatch");
     }
 

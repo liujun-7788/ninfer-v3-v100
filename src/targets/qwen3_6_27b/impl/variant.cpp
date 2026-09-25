@@ -7,12 +7,22 @@
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_pair.h"
 #include "ninfer/ops/linear_swiglu.h"
+#include "ops/linear/nvfp4/nvfp4_cutlass_sm70.h"
 #include "ninfer/ops/mtp_pack.h"
 #include "ninfer/ops/residual_add.h"
 #include "ninfer/ops/silu_mul.h"
 
+#include "core/tp_exec.h"
+
+#include <cuda_runtime.h>
+
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
+#include <cstring>
+#include <vector>
 #include <stdexcept>
+#include <string>
 
 #define NINFER_QWEN36_VARIANT    ::ninfer::targets::qwen3_6_27b::detail::Variant
 #define NINFER_QWEN36_RUNTIME_NS qwen3_6_27b_runtime
@@ -20,6 +30,26 @@
 
 namespace ninfer::targets::qwen3_6_27b::detail {
 namespace {
+
+// TP2: the attention/GDN out-projection input is the full 6144 rows on every rank
+// (mixer cores are replicated), so one rank's K-half of a dim-0 slice is strided
+// (per-token gaps) and cannot feed the GEMM directly; stage it densely in workspace.
+Tensor tp2_stage_k_half(const Tensor& activation, int k_half, int tokens,
+                        WorkspaceArena& workspace, cudaStream_t stream) {
+    Tensor full = activation.view({static_cast<int>(activation.numel()) / tokens, tokens});
+    Tensor dense = workspace.alloc(DType::BF16, {k_half, tokens});
+    const auto* src = static_cast<const std::byte*>(full.data) +
+                      static_cast<std::int64_t>(tpexec::rank()) * k_half * full.nb[0];
+    const cudaError_t err =
+        cudaMemcpy2DAsync(dense.data, static_cast<std::size_t>(k_half) * 2, src,
+                          static_cast<std::size_t>(full.nb[1]), static_cast<std::size_t>(k_half) * 2,
+                          static_cast<std::size_t>(tokens), cudaMemcpyDeviceToDevice, stream);
+    if (err != cudaSuccess) {
+        throw std::runtime_error(std::string("tp2 stage k half: ") + cudaGetErrorString(err));
+    }
+    return dense;
+}
+
 
 std::vector<GraphExecutionProfile>
 graph_profiles_through(std::uint32_t max_frontier,
@@ -72,14 +102,16 @@ std::size_t gdn_snapshot_workspace_bytes(const Tensor& hidden,
         return std::max(kMinimumLeafWorkspaceBytes,
                         ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
                             TextConfig::key_dim, TextConfig::key_dim, TextConfig::value_dim, batch,
-                            width, width));
+                            width, width)) +
+               (1u << 21);
     }
     const Weight& parent =
         std::get<FusedGdnInputProjectionPayload>(weights.input_projection).query_key_value_z;
     return std::max(
         kMinimumLeafWorkspaceBytes,
         ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-            parent.qtype, parent.n, parent.k, text_policy(parent), batch, width, width));
+            parent.qtype, parent.n, parent.k, text_policy(parent), batch, width, width)) +
+           (1u << 21);
 }
 
 std::size_t gdn_record_workspace_bytes(const Tensor& hidden,
@@ -90,14 +122,16 @@ std::size_t gdn_record_workspace_bytes(const Tensor& hidden,
         return std::max(kMinimumLeafWorkspaceBytes,
                         ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
                             TextConfig::key_dim, TextConfig::key_dim, TextConfig::value_dim, batch,
-                            width, width));
+                            width, width)) +
+               (1u << 21);
     }
     const Weight& parent =
         std::get<FusedGdnInputProjectionPayload>(weights.input_projection).query_key_value_z;
     return std::max(
         kMinimumLeafWorkspaceBytes,
         ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
-            parent.qtype, parent.n, parent.k, text_policy(parent), batch, width, width));
+            parent.qtype, parent.n, parent.k, text_policy(parent), batch, width, width)) +
+           (1u << 21);
 }
 
 std::size_t post_mixer_workspace_bytes(QType gate_up_qtype, QType down_qtype,
@@ -105,6 +139,12 @@ std::size_t post_mixer_workspace_bytes(QType gate_up_qtype, QType down_qtype,
                                        std::int32_t last) {
     WorkspaceLayoutBuilder layout;
     (void)layout.alloc(DType::BF16, {TextConfig::intermediate, last});
+    // TP2 shard: the decode branch holds a full-width gate_up tensor live next to the
+    // half-width activation (the full-weight plan only covers the full-width activation), so
+    // the plan needs 8704 extra live rows. Capped at the manual route's token ceiling of 32 --
+    // wider tokens take the fused route, whose scratch the swiglu capacity already covers.
+    (void)layout.alloc_bytes(static_cast<std::size_t>(TextConfig::intermediate / 2) *
+                             static_cast<std::size_t>(std::min(last, 32)) * 2);
     {
         auto scope = layout.scope();
         (void)layout.alloc_bytes(ops::linear_swiglu_workspace_capacity_bytes(
@@ -185,6 +225,17 @@ void Variant::attention_projection(const Tensor& hidden,
 void Variant::attention_output_projection(const Tensor& attention, const Weight& weight,
                                           Tensor& residual, qwen3_6::TextPhase,
                                           WorkspaceArena& workspace, cudaStream_t stream) {
+    // TP2: the out projection is K-sharded to 3072; each rank computes its half into the
+    // site-0 delta buffer and the allreduce sums it into the residual.
+    if (tpexec::active() && weight.k == 3072) {
+        const int tokens = attention.ne[1];
+        Tensor input     = tp2_stage_k_half(attention, weight.k, tokens, workspace, stream);
+        Tensor delta     = tpexec::site_delta(0, tokens);
+        ops::linear(input, weight, delta, text_policy(weight), workspace, stream);
+        tpexec::allreduce_bf16(0, tokens);
+        ops::residual_add(tpexec::site_sum(0, tokens), residual, stream);
+        return;
+    }
     ops::linear_add(attention, weight, residual, text_policy(weight), workspace, stream);
 }
 
@@ -284,6 +335,17 @@ void Variant::gdn_input_projection_record(const Tensor& hidden, const GdnProject
 void Variant::gdn_output_projection(const Tensor& hidden, const Weight& weight, Tensor& residual,
                                     qwen3_6::TextPhase, WorkspaceArena& workspace,
                                     cudaStream_t stream) {
+    // TP2: same site-0 allreduce as the attention out projection (only one of the two runs
+    // per layer, so they share the site and the parity counter).
+    if (tpexec::active() && weight.k == 3072) {
+        const int tokens = hidden.ne[1];
+        Tensor input     = tp2_stage_k_half(hidden, weight.k, tokens, workspace, stream);
+        Tensor delta     = tpexec::site_delta(0, tokens);
+        ops::linear(input, weight, delta, text_policy(weight), workspace, stream);
+        tpexec::allreduce_bf16(0, tokens);
+        ops::residual_add(tpexec::site_sum(0, tokens), residual, stream);
+        return;
+    }
     ops::linear_add(hidden, weight, residual, text_policy(weight), workspace, stream);
 }
 
@@ -308,7 +370,43 @@ void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor& 
 void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
                          qwen3_6::TextPhase, const ::ninfer::ops::SparseMoeHints&,
                          WorkspaceArena& workspace, cudaStream_t stream) {
-    auto scope        = workspace.scope();
+    auto scope = workspace.scope();
+    // TP2: gate_up is N-sharded and regrouped gate|up per rank. The fused linear_swiglu op
+    // only accepts the full 34816-row shape, so the shard runs as linear + silu_mul on the
+    // regrouped halves; the down projection is K-sharded into the site-1 delta + allreduce.
+    if (tpexec::active() && weights.gate_up.n == TextConfig::intermediate) {
+        const int tokens = hidden.ne[1];
+        Tensor activation =
+            workspace.alloc(DType::BF16, {TextConfig::intermediate / 2, tokens});
+        if (tokens > 32 && weights.gate_up.qtype == QType::NVFP4) {
+            // Wide prefill: the fused swiglu plan's cutlass route dequantizes and streams the
+            // weight once, while plain-linear's quadpair MMA kernel re-streams it per 32-token
+            // tile -- at prefill widths that difference eats the TP2 compute savings.
+            ops::linear_swiglu(hidden, weights.gate_up, activation,
+                               text_policy(weights.gate_up), workspace, stream);
+        } else {
+            Tensor gate_up = workspace.alloc(DType::BF16, {TextConfig::intermediate, tokens});
+            ops::linear(hidden, weights.gate_up, gate_up, text_policy(weights.gate_up), workspace,
+                        stream);
+            ops::silu_mul(gate_up.slice(0, 0, TextConfig::intermediate / 2),
+                          gate_up.slice(0, TextConfig::intermediate / 2,
+                                        TextConfig::intermediate / 2),
+                          activation, stream);
+        }
+        Tensor delta = tpexec::site_delta(1, tokens);
+        if (tokens > 32 && weights.down.qtype == QType::NVFP4) {
+            // Same bypass as gate_up: plain-linear's wide-T route re-streams the K-shard per
+            // 32-token tile; the cutlass route streams it once. Decode keeps plain-linear.
+            ops::detail::nvfp4_cutlass_sm70_launch(activation, weights.down, delta, workspace,
+                                                   stream);
+        } else {
+            ops::linear(activation, weights.down, delta, text_policy(weights.down), workspace,
+                        stream);
+        }
+        tpexec::allreduce_bf16(1, tokens);
+        ops::residual_add(tpexec::site_sum(1, tokens), residual, stream);
+        return;
+    }
     Tensor activation = workspace.alloc(DType::BF16, {TextConfig::intermediate, hidden.ne[1]});
     ops::linear_swiglu(hidden, weights.gate_up, activation, text_policy(weights.gate_up), workspace,
                        stream);

@@ -11,6 +11,7 @@
 namespace ninfer {
 
 class PpLink;
+class TpGroup;
 struct DeviceContext;
 
 namespace targets {
@@ -37,6 +38,7 @@ struct Qwen3_6_27BInstance {
     runtime::KvCapacityResolution kv_capacity_resolution;
     const std::uint32_t capacity;
     std::unique_ptr<PpLink> pp;
+    std::unique_ptr<TpGroup> tp;
     std::vector<std::unique_ptr<Qwen3_6_27B::LoadedModel>> stage_models;
     std::unique_ptr<Qwen3_6_27B::Program> program;
 
@@ -45,6 +47,7 @@ struct Qwen3_6_27BInstance {
                         Qwen3_6_27B::SequencePlan sequence_plan, DeviceContext& device,
                         const StartupObserver& startup_observer,
                         std::unique_ptr<PpLink> pipeline = {},
+                        std::unique_ptr<TpGroup> tp_link = {},
                         std::vector<std::unique_ptr<Qwen3_6_27B::LoadedModel>> stage_models = {});
     ~Qwen3_6_27BInstance();
 
@@ -76,8 +79,9 @@ struct Qwen3_6_35BA3BInstance {
                            runtime::KvCapacityResolution resolution,
                            Qwen3_6_35BA3B::SequencePlan sequence_plan, DeviceContext& device,
                            const StartupObserver& startup_observer,
-                           std::unique_ptr<PpLink> pipeline                            = {},
-                           std::vector<std::unique_ptr<Qwen3_6_35BA3B::LoadedModel>> rank1_model_35b = {});
+                        std::unique_ptr<PpLink> pipeline                            = {},
+                        std::unique_ptr<TpGroup> tp_link                            = {},
+                        std::vector<std::unique_ptr<Qwen3_6_35BA3B::LoadedModel>> rank1_model_35b = {});
     ~Qwen3_6_35BA3BInstance();
 
     Qwen3_6_35BA3BInstance(const Qwen3_6_35BA3BInstance&)            = delete;

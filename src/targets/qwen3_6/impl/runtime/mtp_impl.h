@@ -1,7 +1,9 @@
+#include <cstdio>
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/schedule.h"
 
 #include "core/nvtx.h"
+#include "core/tp_exec.h"
 #include "ninfer/ops/mtp_round.h"
 #include "ninfer/ops/scatter.h"
 #include "ninfer/ops/scalar.h"
@@ -72,6 +74,9 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size,
                            std::uint32_t verify_k, std::uint32_t proposal_k,
                            MtpCausalAttentionEnvelopes envelopes) {
     return [&state, batch_size, verify_k, proposal_k, envelopes] {
+        // Must run inside the body: capture and direct execution both need g_rank bound to
+        // the device actually executing this lambda (graph replay or fallback).
+        tpexec::bind_rank(state.execution.device);
         if (batch_size <= 0 || batch_size > static_cast<std::int32_t>(kMaximumConcurrency) ||
             verify_k == 0 || verify_k > kMtpLookupMaximumDrafts || proposal_k == 0 ||
             proposal_k > kMtpDecodeMaximumDrafts || proposal_k > verify_k) {
@@ -197,9 +202,15 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size,
             }
         }
 
-        CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, frame.egress.data,
-                                   sizeof(qwen3_6::MtpDecodeEgress), cudaMemcpyDeviceToHost,
-                                   state.execution.device.stream));
+        // TP2: the whole MTP decode body (target verify + draft) runs redundantly on both
+        // ranks — the draft has no allreduces and the target's per-layer AR sequence is
+        // geometry-fixed — but only the head rank's egress (argmax/accept counts) is
+        // meaningful, since rank1's lm_head output is garbage.
+        if (tpexec::head_rank()) {
+            CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, frame.egress.data,
+                                       sizeof(qwen3_6::MtpDecodeEgress), cudaMemcpyDeviceToHost,
+                                       state.execution.device.stream));
+        }
     };
 }
 

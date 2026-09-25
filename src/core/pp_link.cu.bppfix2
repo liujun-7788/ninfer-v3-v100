@@ -112,27 +112,23 @@ const DeviceContext& PpLink::rank(std::size_t index) const {
 void PpLink::enable_peer_access() {
     for (std::size_t r = 0; r < ranks_.size(); ++r) {
         DeviceContext& ctx = *ranks_[r];
+        // Adjacent-pair peer access suffices for the linear pipeline.
+        const std::size_t peer = r + 1 < ranks_.size() ? r + 1 : r - 1;
+        int peer_accessible    = 0;
+        CUDA_CHECK(cudaDeviceCanAccessPeer(&peer_accessible, ctx.device,
+                                           ranks_[peer]->device));
+        if (peer_accessible == 0) {
+            throw std::runtime_error("PpLink ranks have no P2P peer access path");
+        }
         ctx.bind_to_current_thread();
-        for (std::size_t p = 0; p < ranks_.size(); ++p) {
-            if (p == r) { continue; }
-            // State-image mirror zeroing and graph capture reach every rank
-            // from the caller stage stream, so every rank pair needs a P2P
-            // path, not just the adjacent ones along the pipeline.
-            int peer_accessible = 0;
-            CUDA_CHECK(cudaDeviceCanAccessPeer(&peer_accessible, ctx.device,
-                                               ranks_[p]->device));
-            if (peer_accessible == 0) {
-                throw std::runtime_error("PpLink ranks have no P2P peer access path");
-            }
-            const cudaError_t err = cudaDeviceEnablePeerAccess(ranks_[p]->device, 0);
-            if (err == cudaErrorPeerAccessAlreadyEnabled) {
-                static_cast<void>(cudaGetLastError());
-                continue;
-            }
-            if (err != cudaSuccess) {
-                static_cast<void>(cudaGetLastError());
-                throw std::runtime_error(pp_cuda_error("cudaDeviceEnablePeerAccess failed", err));
-            }
+        const cudaError_t err = cudaDeviceEnablePeerAccess(ranks_[peer]->device, 0);
+        if (err == cudaErrorPeerAccessAlreadyEnabled) {
+            static_cast<void>(cudaGetLastError());
+            continue;
+        }
+        if (err != cudaSuccess) {
+            static_cast<void>(cudaGetLastError());
+            throw std::runtime_error(pp_cuda_error("cudaDeviceEnablePeerAccess failed", err));
         }
     }
 }

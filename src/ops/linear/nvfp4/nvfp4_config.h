@@ -123,6 +123,16 @@ using Nvfp4MlpGateUpGeometry     = Nvfp4GemvGeometry<34816, 5120>;
 using Nvfp4Residual6144Geometry  = Nvfp4GemvGeometry<5120, 6144>;
 using Nvfp4Residual17408Geometry = Nvfp4GemvGeometry<5120, 17408>;
 
+// TP2 shard geometries. Per rank: attention/MTP fused projection split by heads into
+// <7168, 5120>, GDN fused projection into <8192, 5120>, MLP gate|up (contiguous halves)
+// into <17408, 5120>, and the K-split output/down projections into <5120, 3072> and
+// <5120, 8704>. OutProjShard serves both attention and GDN output projections.
+using Nvfp4AttnInputShardGeometry = Nvfp4GemvGeometry<7168, 5120>;
+using Nvfp4GdnInputShardGeometry  = Nvfp4GemvGeometry<8192, 5120>;
+using Nvfp4MlpGateUpShardGeometry = Nvfp4GemvGeometry<17408, 5120>;
+using Nvfp4OutProjShardGeometry   = Nvfp4GemvGeometry<5120, 3072>;
+using Nvfp4DownShardGeometry      = Nvfp4GemvGeometry<5120, 8704>;
+
 using Nvfp4Activation5120Geometry  = Nvfp4ActivationGeometry<5120>;
 using Nvfp4Activation6144Geometry  = Nvfp4ActivationGeometry<6144>;
 using Nvfp4Activation17408Geometry = Nvfp4ActivationGeometry<17408>;
@@ -133,6 +143,11 @@ enum class Nvfp4Problem : std::uint8_t {
     MlpGateUp,
     Residual6144,
     Residual17408,
+    AttnInputShard,
+    GdnInputShard,
+    MlpGateUpShard,
+    OutProjShard,
+    DownShard,
 };
 
 inline constexpr bool is_nvfp4_linear_problem(std::int32_t output_rows, std::int32_t input_rows) {
@@ -145,7 +160,17 @@ inline constexpr bool is_nvfp4_linear_problem(std::int32_t output_rows, std::int
            (output_rows == Nvfp4Residual6144Geometry::kOutputRows &&
             input_rows == Nvfp4Residual6144Geometry::kInputRows) ||
            (output_rows == Nvfp4Residual17408Geometry::kOutputRows &&
-            input_rows == Nvfp4Residual17408Geometry::kInputRows);
+            input_rows == Nvfp4Residual17408Geometry::kInputRows) ||
+           (output_rows == Nvfp4AttnInputShardGeometry::kOutputRows &&
+            input_rows == Nvfp4AttnInputShardGeometry::kInputRows) ||
+           (output_rows == Nvfp4GdnInputShardGeometry::kOutputRows &&
+            input_rows == Nvfp4GdnInputShardGeometry::kInputRows) ||
+           (output_rows == Nvfp4MlpGateUpShardGeometry::kOutputRows &&
+            input_rows == Nvfp4MlpGateUpShardGeometry::kInputRows) ||
+           (output_rows == Nvfp4OutProjShardGeometry::kOutputRows &&
+            input_rows == Nvfp4OutProjShardGeometry::kInputRows) ||
+           (output_rows == Nvfp4DownShardGeometry::kOutputRows &&
+            input_rows == Nvfp4DownShardGeometry::kInputRows);
 }
 
 inline Nvfp4Problem resolve_nvfp4_problem(std::int32_t output_rows, std::int32_t input_rows) {
@@ -168,6 +193,26 @@ inline Nvfp4Problem resolve_nvfp4_problem(std::int32_t output_rows, std::int32_t
     if (output_rows == Nvfp4Residual17408Geometry::kOutputRows &&
         input_rows == Nvfp4Residual17408Geometry::kInputRows) {
         return Nvfp4Problem::Residual17408;
+    }
+    if (output_rows == Nvfp4AttnInputShardGeometry::kOutputRows &&
+        input_rows == Nvfp4AttnInputShardGeometry::kInputRows) {
+        return Nvfp4Problem::AttnInputShard;
+    }
+    if (output_rows == Nvfp4GdnInputShardGeometry::kOutputRows &&
+        input_rows == Nvfp4GdnInputShardGeometry::kInputRows) {
+        return Nvfp4Problem::GdnInputShard;
+    }
+    if (output_rows == Nvfp4MlpGateUpShardGeometry::kOutputRows &&
+        input_rows == Nvfp4MlpGateUpShardGeometry::kInputRows) {
+        return Nvfp4Problem::MlpGateUpShard;
+    }
+    if (output_rows == Nvfp4OutProjShardGeometry::kOutputRows &&
+        input_rows == Nvfp4OutProjShardGeometry::kInputRows) {
+        return Nvfp4Problem::OutProjShard;
+    }
+    if (output_rows == Nvfp4DownShardGeometry::kOutputRows &&
+        input_rows == Nvfp4DownShardGeometry::kInputRows) {
+        return Nvfp4Problem::DownShard;
     }
     throw std::invalid_argument("unsupported NVFP4 problem");
 }

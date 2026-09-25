@@ -115,7 +115,7 @@ Weight materialized_weight(const artifact::MaterializedArtifact& materialized,
         // The load-time QPN permutation is only legal for weights consumed by the QPN linear
         // kernels. text/token_embedding is read row-major by the embedding gather, so it must
         // keep its checkpoint layout.
-        if (prepack_for_qpn && out.qtype == QType::FP8_E4M3FN_ROW_BF16S) {
+        if (prepack_for_qpn && !plan.tp_shard && out.qtype == QType::FP8_E4M3FN_ROW_BF16S) {
             ::ninfer::ops::detail::fp8_prepack_qpn_sm70(out);
         }
 #else
@@ -188,10 +188,10 @@ DensePostMixerPayload load_mlp(const MlpPlan& plan,
 #ifdef NINFER_VOLTA_BUILD
     // The mixed profile allows gate_up and down formats to differ; prepack
     // each NVFP4 weight on its own qtype instead of keying off gate_up.
-    if (out.gate_up.qtype == QType::NVFP4) {
+    if (out.gate_up.qtype == QType::NVFP4 && !plan.gate_up.tp_shard) {
         ::ninfer::ops::detail::nvfp4_prepack_qpn_sm70(out.gate_up);
     }
-    if (out.down.qtype == QType::NVFP4) {
+    if (out.down.qtype == QType::NVFP4 && !plan.down.tp_shard) {
         ::ninfer::ops::detail::nvfp4_prepack_qpn_sm70(out.down);
     }
 #endif
@@ -614,6 +614,43 @@ void validate_draft_ids(const artifact::Binder& binder, artifact::ObjectHandle h
 }
 
 } // namespace
+
+// External linkage on purpose: package.cpp (plan_load) calls this to flag
+// every projection weight for two-way tensor-parallel sharding. It must stay
+// outside the anonymous namespace above or it acquires internal linkage.
+void mark_tp_shard(BindingPlan& plan) {
+    for (TextLayerPlan& layer : plan.text_layers) {
+        if (layer.is_full_attention) {
+            auto* fused = std::get_if<FusedAttentionProjectionPlan>(&layer.attention.projection);
+            if (fused == nullptr) {
+                throw std::logic_error(
+                    "tp2 requires fused attention projections (split plans are unsupported)");
+            }
+            fused->query_key_gate_value.tp_shard = true;
+        } else {
+            auto* fused_in =
+                std::get_if<FusedGdnInputProjectionPlan>(&layer.gdn.input_projection);
+            if (fused_in == nullptr) {
+                throw std::logic_error(
+                    "tp2 requires fused gdn input projections (split plans are unsupported)");
+            }
+            fused_in->query_key_value_z.tp_shard = true;
+            auto* fused_ctl =
+                std::get_if<FusedGdnControlProjectionPlan>(&layer.gdn.control_projection);
+            if (fused_ctl == nullptr) {
+                throw std::logic_error(
+                    "tp2 requires fused gdn control projections (split plans are unsupported)");
+            }
+            fused_ctl->a_b_projection.tp_shard = true;
+        }
+        layer.attention.output.tp_shard = true;
+        layer.gdn.output.tp_shard       = true;
+        layer.mlp.gate_up.tp_shard      = true;
+        layer.mlp.down.tp_shard         = true;
+    }
+    plan.mtp.mlp.gate_up.tp_shard = true;
+    plan.mtp.mlp.down.tp_shard    = true;
+}
 
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_profile,
                                qwen3_6::StartupFeatures features) {

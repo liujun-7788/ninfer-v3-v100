@@ -384,8 +384,8 @@ void DeviceKVPagePool::materialize(DeviceKVPageReservation& reservation,
             std::size_t end = begin + 1;
             while (end < mirrored_pages.size() &&
                    mirrored_pages[end] == mirrored_pages[end - 1] + 1) { ++end; }
-            mirrors_[0]->mirror_take_pages(mirrored_pages[begin],
-                                       static_cast<std::uint32_t>(end - begin));
+            m->mirror_take_pages(mirrored_pages[begin],
+                                 static_cast<std::uint32_t>(end - begin));
             begin = end;
         }
     }

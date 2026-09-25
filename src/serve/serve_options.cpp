@@ -274,6 +274,21 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             }
             options.device     = devices.front();
             options.pp_devices = std::move(devices);
+        } else if (arg == "--tp-devices") {
+            const std::string value = require_value("--tp-devices");
+            std::vector<int> devices;
+            std::size_t begin = 0;
+            while (true) {
+                const auto comma = value.find(',', begin);
+                const std::string part = comma == std::string::npos
+                                             ? value.substr(begin)
+                                             : value.substr(begin, comma - begin);
+                devices.push_back(parse_nonnegative_int(part.c_str(), "tp-devices entry"));
+                if (comma == std::string::npos) { break; }
+                begin = comma + 1;
+            }
+            options.device     = devices.front();
+            options.tp_devices = std::move(devices);
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
         } else if (arg == "--spec") {

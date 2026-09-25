@@ -2,6 +2,7 @@
 
 #include "core/layout.h"
 #include "ops/gdn_input_proj/fp8/fp8_gdn_input_plan.h"
+#include "ops/gdn_input_proj/fp8/fp8_gdn_input_cutlass_sm70.h"
 #include "ops/gdn_input_proj/gdn_projected_conv.h"
 #include "ops/linear/fp8/fp8_a8_plan.h"
 #include "ops/linear/fp8/fp8_config.h"
@@ -64,6 +65,9 @@ std::size_t snapshot_capacity(Fp8GdnConvPlan maximum_plan, std::int32_t material
     } else {
         (void)layout.alloc_bytes(static_cast<std::size_t>(Fp8GdnInputGeometry::kInputRows) *
                                  materialized_columns * sizeof(std::uint16_t));
+        // The A16 dispatch takes the wide-T CUTLASS route at T>=33; its w_fp16 dequant
+        // scratch dominates this arena and must be reported alongside the staging buffer.
+        (void)layout.alloc_bytes(fp8_gdn_input_cutlass_workspace_bytes(materialized_columns));
 #endif
     }
     return layout.peak_bytes(1);
@@ -76,8 +80,11 @@ std::size_t record_capacity(Fp8GdnConvPlan plan, std::int32_t aggregate_columns)
     }
 #ifdef NINFER_VOLTA_BUILD
     if (plan.schedule == Fp8GdnConvScheduleId::MaterializedA16) {
-        return static_cast<std::size_t>(Fp8GdnInputGeometry::kInputRows) * aggregate_columns *
-               sizeof(std::uint16_t);
+        // Same CUTLASS-scratch accounting as the snapshot path: the dispatch's wide-T route
+        // allocates the full w_fp16 dequant plane from this arena at T>=33.
+        std::size_t capacity = static_cast<std::size_t>(Fp8GdnInputGeometry::kInputRows) *
+                               aggregate_columns * sizeof(std::uint16_t);
+        return std::max(capacity, fp8_gdn_input_cutlass_workspace_bytes(aggregate_columns));
     }
 #endif
     return 0;

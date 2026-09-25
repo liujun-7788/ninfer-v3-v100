@@ -4,6 +4,7 @@
 
 #include "core/nvtx.h"
 #include "core/pp_link.h"
+#include "core/tp_exec.h"
 
 #include <cstdio>
 #include <cuda_bf16.h>
@@ -696,7 +697,11 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
         run_layers(x, Phase::Verify, tap);
         if (pp_last) {
             ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, hidden, stream);
-            ops::linear(hidden, *lm_head_, logits, stream);
+            // TP2: rank1's lm_head output is garbage; skip the GEMM but keep the rmsnorm so
+            // both ranks' final hidden states stay identical for their consumers.
+            if (tpexec::head_rank()) {
+                ops::linear(hidden, *lm_head_, logits, stream);
+            }
         }
     }
     work_.reset();
@@ -761,6 +766,12 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
         Tensor flat_tokens = target_tokens.view({columns});
         if (pp_last) {
             ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, flat_hidden, stream);
+            // TP2: BOTH ranks must compute target_tokens. The accept/select/scatter ops
+            // below run on every rank and drive the GDN replay commit and the next-round
+            // draft input; if rank1 used stale target_tokens its state would diverge from
+            // rank0 and the out_proj allreduce would mix divergent residuals. rank1's
+            // flat_hidden is bit-identical to rank0's (AR site sums match), so the extra
+            // vocab GEMM yields identical tokens and runs concurrently with rank0's.
             ops::linear(flat_hidden, *lm_head_, flat_logits, stream);
             ops::argmax(flat_logits, flat_tokens, kCfg.token_domain, stream);
         }
@@ -1299,7 +1310,9 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, xf, s);
             }
 
-            if (is_last && pp_last) {
+            // TP2: only the head rank runs the lm_head / sampling path; rank1's logits are
+            // garbage and its io_.token stays unset.
+            if (is_last && pp_last && tpexec::head_rank()) {
                 Tensor last_xf = xf.slice(1, len - 1, 1);
                 Tensor logits  = matrix_window(io_.logits, 1);
                 ops::linear(last_xf, *lm_head_, logits, s);
@@ -1327,7 +1340,11 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 }
             }
 
-            if (prepare_mtp_prompt && pp_last) {
+            // TP2: the whole MTP prompt bridge/proposal path is host-gated to the head rank —
+            // it reads io_.token (unset on rank1), writes the draft KV mirror (redundant) and
+            // contains no allreduces, so rank1 skipping it cannot desync the collective
+            // sequence (prefill ARs happen inside run_layers above).
+            if (prepare_mtp_prompt && pp_last && tpexec::head_rank()) {
                 const std::uint32_t alignment_tokens =
                     multimodal != nullptr ? static_cast<std::uint32_t>(multimodal->token_ids.size())
                     : text_prefill != nullptr

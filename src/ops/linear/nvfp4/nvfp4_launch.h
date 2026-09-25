@@ -32,6 +32,11 @@ void launch_nvfp4_volta_mma(const Tensor& x, const Weight& w, Tensor& out, Works
 [[nodiscard]] std::size_t nvfp4_volta_mma_workspace_bytes(std::int32_t n, std::int32_t k,
                                                           std::int32_t t) noexcept;
 [[nodiscard]] int nvfp4_volta_mma_splits(std::int32_t n, std::int32_t k, std::int32_t t) noexcept;
+// Fused-dequant T-on-A mma kernel (raw layout only); gated behind NINFER_NVFP4_TMMA.
+void nvfp4_volta_tmma_gemm_launch(const Tensor& x, const Weight& weight, Tensor& out,
+                                  cudaStream_t stream);
+
 #endif // NINFER_VOLTA_BUILD
 
 } // namespace ninfer::ops::detail
+

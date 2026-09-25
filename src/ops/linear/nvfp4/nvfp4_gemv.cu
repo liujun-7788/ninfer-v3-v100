@@ -49,6 +49,21 @@ void launch_nvfp4_decode(const Tensor& x, const Weight& weight, Tensor& out, cud
     case Nvfp4Problem::Residual17408:
         launch_exact<Nvfp4Residual17408Geometry>(x, weight, out, stream);
         return;
+    case Nvfp4Problem::AttnInputShard:
+        launch_exact<Nvfp4AttnInputShardGeometry>(x, weight, out, stream);
+        return;
+    case Nvfp4Problem::GdnInputShard:
+        launch_exact<Nvfp4GdnInputShardGeometry>(x, weight, out, stream);
+        return;
+    case Nvfp4Problem::MlpGateUpShard:
+        launch_exact<Nvfp4MlpGateUpShardGeometry>(x, weight, out, stream);
+        return;
+    case Nvfp4Problem::OutProjShard:
+        launch_exact<Nvfp4OutProjShardGeometry>(x, weight, out, stream);
+        return;
+    case Nvfp4Problem::DownShard:
+        launch_exact<Nvfp4DownShardGeometry>(x, weight, out, stream);
+        return;
     }
 }
 

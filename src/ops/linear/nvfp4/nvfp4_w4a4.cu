@@ -128,7 +128,14 @@ void launch_nvfp4_w4a4(const Tensor& x, const Weight& weight, Tensor& out,
     case Nvfp4Problem::Residual17408:
         launch_problem<Nvfp4Residual17408Geometry>(weight, out, workspace, tokens, stream);
         return;
+    case Nvfp4Problem::AttnInputShard:
+    case Nvfp4Problem::GdnInputShard:
+    case Nvfp4Problem::MlpGateUpShard:
+    case Nvfp4Problem::OutProjShard:
+    case Nvfp4Problem::DownShard:
+        break;
     }
+    throw std::logic_error("nvfp4 W4A4 has no TP2 shard route");
 }
 
 } // namespace ninfer::ops::detail

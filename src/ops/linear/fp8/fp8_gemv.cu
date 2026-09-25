@@ -54,6 +54,21 @@ void launch_fp8_decode(const Tensor& x, const Weight& weight, Tensor& out, cudaS
     case Fp8Problem::Residual17408:
         launch_exact<Fp8Residual17408Geometry>(x, weight, out, stream);
         return;
+    case Fp8Problem::AttnInputShard:
+        launch_exact<Fp8AttnInputShardGeometry>(x, weight, out, stream);
+        return;
+    case Fp8Problem::GdnInputShard:
+        launch_exact<Fp8GdnInputShardGeometry>(x, weight, out, stream);
+        return;
+    case Fp8Problem::MlpGateUpShard:
+        launch_exact<Fp8MlpGateUpShardGeometry>(x, weight, out, stream);
+        return;
+    case Fp8Problem::OutProjShard:
+        launch_exact<Fp8OutProjShardGeometry>(x, weight, out, stream);
+        return;
+    case Fp8Problem::DownShard:
+        launch_exact<Fp8DownShardGeometry>(x, weight, out, stream);
+        return;
     }
     throw std::logic_error("FP8 vocabulary decode uses its A16 MMA route");
 }

@@ -64,6 +64,21 @@ void launch_nvfp4_small_t(const Tensor& x, const Weight& weight, Tensor& out, cu
     case Nvfp4Problem::Residual17408:
         launchers<Nvfp4Residual17408Geometry>()[index](x, weight, out, stream);
         return;
+    case Nvfp4Problem::AttnInputShard:
+        launchers<Nvfp4AttnInputShardGeometry>()[index](x, weight, out, stream);
+        return;
+    case Nvfp4Problem::GdnInputShard:
+        launchers<Nvfp4GdnInputShardGeometry>()[index](x, weight, out, stream);
+        return;
+    case Nvfp4Problem::MlpGateUpShard:
+        launchers<Nvfp4MlpGateUpShardGeometry>()[index](x, weight, out, stream);
+        return;
+    case Nvfp4Problem::OutProjShard:
+        launchers<Nvfp4OutProjShardGeometry>()[index](x, weight, out, stream);
+        return;
+    case Nvfp4Problem::DownShard:
+        launchers<Nvfp4DownShardGeometry>()[index](x, weight, out, stream);
+        return;
     }
 }
 

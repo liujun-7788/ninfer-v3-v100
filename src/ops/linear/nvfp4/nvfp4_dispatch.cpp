@@ -6,6 +6,7 @@
 #include "ops/linear/nvfp4/nvfp4_w4a4_plan.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstdint>
 #include <stdexcept>
 
@@ -37,6 +38,17 @@ Nvfp4LinearRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows
     case Nvfp4Problem::Residual6144:
     case Nvfp4Problem::Residual17408:
         return tokens >= 8 ? Nvfp4LinearRoute::W4A4 : Nvfp4LinearRoute::A16;
+    // TP2 shard geometries mirror their fused-problem cutoffs. The Volta build runs
+    // A16Only and returns above, so these routes only exist for the Blackwell build.
+    case Nvfp4Problem::AttnInputShard:
+        return tokens >= 4 ? Nvfp4LinearRoute::W4A4 : Nvfp4LinearRoute::A16;
+    case Nvfp4Problem::GdnInputShard:
+        return Nvfp4LinearRoute::W4A4;
+    case Nvfp4Problem::MlpGateUpShard:
+        return tokens >= 5 ? Nvfp4LinearRoute::W4A4 : Nvfp4LinearRoute::A16;
+    case Nvfp4Problem::OutProjShard:
+    case Nvfp4Problem::DownShard:
+        return tokens >= 8 ? Nvfp4LinearRoute::W4A4 : Nvfp4LinearRoute::A16;
     }
     throw std::logic_error("unreachable NVFP4 linear problem");
 }
@@ -56,6 +68,12 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out,
     // workspace only when split-K applies (rare at production shapes -- both registered NVFP4
     // shapes measured splits=1 at prefill width); fall back to the chunked route rather than
     // fault if a caller genuinely has none. See docs/v100.md.
+    static const bool use_tmma = std::getenv("NINFER_NVFP4_TMMA") != nullptr;
+    if (use_tmma && workspace != nullptr && total_t > kNvfp4VoltaQpnMaxTokens &&
+        weight.layout == QuantLayout::BlockScaleK16M128x4 && weight.k % 32 == 0) {
+        nvfp4_volta_tmma_gemm_launch(x, weight, out, stream);
+        return;
+    }
     if (workspace != nullptr && total_t > kNvfp4VoltaQpnMaxTokens &&
         nvfp4_volta_mma_supported(weight.n, weight.k, total_t)) {
         const std::size_t need = nvfp4_volta_mma_workspace_bytes(weight.n, weight.k, total_t);

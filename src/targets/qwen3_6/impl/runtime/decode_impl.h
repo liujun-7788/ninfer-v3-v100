@@ -1,6 +1,7 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/schedule.h"
 
+#include "core/tp_exec.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/scatter.h"
 
@@ -12,6 +13,9 @@ namespace {
 auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
                          ops::CausalAttentionExecutionEnvelope envelope) {
     return [&state, batch_size, envelope] {
+        // Must run inside the body: capture and direct execution both need g_rank bound to
+        // the device actually executing this lambda (graph replay or fallback).
+        tpexec::bind_rank(state.execution.device);
         if (batch_size <= 0 || batch_size > static_cast<std::int32_t>(kMaximumConcurrency)) {
             throw std::logic_error("ordinary decode batch state is incomplete");
         }
@@ -51,8 +55,10 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
 
         card.ordinary_decode_batch(tokens, cache_positions, rope_positions, kv_rows, state_sources,
                                    state_destinations, envelope, hidden, logits);
-        if (state.execution.layer_end == 0 ||
-            state.execution.layer_end >= 64) {
+        // TP2: only the head rank's egress is meaningful (its lm_head output is the full
+        // vocabulary); rank1's logits are garbage but its allreduce sequence is identical.
+        if ((state.execution.layer_end == 0 || state.execution.layer_end >= 64) &&
+            tpexec::head_rank()) {
             ops::scatter(hidden, state_destinations, state.continuation_hidden_store,
                          state.execution.device.stream);
             ops::sample(logits, sampled, TextConfig::token_domain, ordinary.sampling,

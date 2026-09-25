@@ -48,6 +48,16 @@ Fp8LinearRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows, 
     case Fp8Problem::Residual6144:
     case Fp8Problem::Residual17408:
         return tokens >= 25 ? Fp8LinearRoute::A8 : Fp8LinearRoute::A16;
+    // TP2 shard geometries mirror their fused-problem cutoffs.
+    case Fp8Problem::AttnInputShard:
+        return tokens >= 12 ? Fp8LinearRoute::A8 : Fp8LinearRoute::A16;
+    case Fp8Problem::GdnInputShard:
+        return tokens >= 11 ? Fp8LinearRoute::A8 : Fp8LinearRoute::A16;
+    case Fp8Problem::MlpGateUpShard:
+        return tokens == 1 || tokens >= 5 ? Fp8LinearRoute::A8 : Fp8LinearRoute::A16;
+    case Fp8Problem::OutProjShard:
+    case Fp8Problem::DownShard:
+        return tokens >= 25 ? Fp8LinearRoute::A8 : Fp8LinearRoute::A16;
     }
     throw std::logic_error("unreachable FP8 linear problem");
 }
@@ -123,6 +133,15 @@ bool interval_uses_a8(Fp8Problem problem, LinearPolicy policy, std::int32_t min_
         return false;
     case Fp8Problem::Residual6144:
     case Fp8Problem::Residual17408:
+        return max_tokens >= 25;
+    case Fp8Problem::AttnInputShard:
+        return max_tokens >= 12;
+    case Fp8Problem::GdnInputShard:
+        return max_tokens >= 11;
+    case Fp8Problem::MlpGateUpShard:
+        return min_tokens == 1 || max_tokens >= 5;
+    case Fp8Problem::OutProjShard:
+    case Fp8Problem::DownShard:
         return max_tokens >= 25;
     }
     throw std::logic_error("unreachable FP8 linear problem");

@@ -171,6 +171,11 @@ struct EngineOptions {
     // states through a PpLink. Every peer must have P2P access along the chain; the first
     // entry must equal `device`. Supported sizes today: 2 and 4.
     std::vector<int> pp_devices;
+    // Tensor-parallel device pair. When exactly two entries are given, the engine loads a
+    // sharded copy of the model on each device and every tensor-parallel linear output is
+    // reduced across the pair through an allreduce. The first entry must equal `device`;
+    // both devices need P2P access to each other. Supported size today: 2.
+    std::vector<int> tp_devices;
     ContextCacheOptions context_cache;
     ContextCostOptions context_cost;
     StartupObserver startup_observer;

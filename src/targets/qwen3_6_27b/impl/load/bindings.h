@@ -28,6 +28,9 @@ struct WeightPlan {
     artifact::NumericFormat format          = artifact::NumericFormat::BF16;
     std::uint32_t weight_scale_divisor_bits = 0;
     std::uint32_t input_scale_divisor_bits  = 0;
+    // Set by mark_tp_shard: the load-time QPN prepack is suppressed for this weight because
+    // tp_shard_model compacts it in place and re-applies the prepack on the sharded layout.
+    bool tp_shard = false;
 };
 
 struct MlpPlan {
@@ -164,6 +167,11 @@ struct ArtifactLoadPlan {
 
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_profile,
                                qwen3_6::StartupFeatures features);
+
+// Flags every per-layer projection weight that TP2 shards. Must run after bind_artifact and
+// before any materialization; throws when a layer uses a split (non-fused) plan because TP2
+// only shards the fused formats.
+void mark_tp_shard(BindingPlan& plan);
 
 struct DensePostMixerPayload {
     Weight gate_up;

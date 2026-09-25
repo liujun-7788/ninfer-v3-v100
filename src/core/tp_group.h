@@ -4,14 +4,15 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <vector>
+#include <memory>
 
 namespace ninfer {
 
 inline constexpr std::size_t kTpMaxSites = 256;
 
 // Fixed two-rank peer group for tensor-parallel execution over P2P-accessible GPUs.
-// The owner moves the rank contexts in (rank 0 stays the Engine's primary DeviceContext).
+// The engine-level entry point takes the primary DeviceContext by reference (rank 0 stays
+// the Engine's primary); the peer DeviceContext is created and owned by the group.
 // Construction enables peer access in both directions; afterwards kernels on one rank may
 // dereference device pointers owned by the other rank directly.
 //
@@ -28,7 +29,7 @@ class TpGroup {
 public:
     static constexpr std::size_t kRankCount = 2;
 
-    explicit TpGroup(std::vector<DeviceContext> contexts);
+    explicit TpGroup(DeviceContext& rank0, int peer_device, std::size_t staging_bytes = 0);
     ~TpGroup();
 
     TpGroup(const TpGroup&)            = delete;
@@ -36,7 +37,7 @@ public:
     TpGroup(TpGroup&& other) noexcept;
     TpGroup& operator=(TpGroup&& other) noexcept;
 
-    [[nodiscard]] std::size_t rank_count() const noexcept { return ranks_.size(); }
+    [[nodiscard]] std::size_t rank_count() const noexcept { return kRankCount; }
     [[nodiscard]] DeviceContext& rank(std::size_t index);
     [[nodiscard]] const DeviceContext& rank(std::size_t index) const;
 
@@ -44,6 +45,24 @@ public:
     // inputs[r]/outputs[r] must be device memory on rank r; inputs and outputs must not alias.
     void allreduce_bf16(const void* const inputs[kRankCount], void* const outputs[kRankCount],
                         std::int64_t count, std::size_t site);
+
+    // Single-rank entry point: enqueues one rank's half of the sum on that rank's own stream.
+    // Each rank calls this independently (lockstep order, same site); the call enqueues the
+    // signal and sum kernels on rank r's stream and returns immediately, so callers drive
+    // both ranks by sequential enqueue without thread rebinding. input/output must be device
+    // memory on rank r; peer_input must be device memory on rank r^1. parity alternates the
+    // staged-path slot so a subsequent call cannot overwrite staging a still-running sum
+    // reads (parity must match between ranks for the same call index).
+    void allreduce_bf16_half(std::size_t r, const void* input, const void* peer_input,
+                             void* output, std::int64_t count, std::size_t site,
+                             std::size_t parity);
+
+    // Preallocates the staged-path buffers. Must be called before any CUDA graph
+    // capture (cudaMalloc is illegal inside a capturing stream) and at most once;
+    // pass the largest single allreduce in bytes.
+    void allocate_staging(std::size_t staging_bytes);
+
+    [[nodiscard]] std::size_t staging_bytes() const noexcept { return staging_bytes_; }
 
 private:
     // Host-pinned mailbox shared by both ranks: PCIe coherence makes it a safe signaling
@@ -57,11 +76,16 @@ private:
 
     void enable_peer_access();
 
-    std::vector<DeviceContext> ranks_;
+    DeviceContext* ranks_[kRankCount]         = {nullptr, nullptr};
+    std::unique_ptr<DeviceContext> peer_owner_;
     Mailbox* mailbox_                         = nullptr;
     unsigned long long* counters_[kRankCount] = {nullptr, nullptr};
     void* staging_[kRankCount]                = {nullptr, nullptr};
     std::size_t staging_bytes_                = 0;
+    // Two parity slots per site in the staged path (slot = site*2 + parity),
+    // allocated as one buffer per rank of 2 * staging_bytes.
+    static constexpr std::size_t kStagingParities = 2;
+    static constexpr std::size_t kTpStagedSites   = 2;
 };
 
 } // namespace ninfer

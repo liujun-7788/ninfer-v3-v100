@@ -36,6 +36,7 @@
 namespace ninfer {
 
 class PpLink;
+class TpGroup;
 
 } // namespace ninfer
 
@@ -706,8 +707,10 @@ public:
         DecodeGraphFamily mtp_graphs;
         DecodeGraphFamily mtp_lookup_graphs;
     };
-    std::vector<RankState> pp_stages;   // stages 1..N-1 (index stage-1)
+    std::vector<RankState> pp_stages;   // stages 1..N-1 (index stage-1); also holds the single
+                                        // tensor-parallel rank-1 mirror set when tp is active
     PpLink* pp_link              = nullptr;
+    TpGroup* tp_group            = nullptr;
     std::uint32_t pp_stage_count = 0;
     std::vector<std::uint32_t> pp_begins;
     std::vector<std::uint32_t> pp_ends;

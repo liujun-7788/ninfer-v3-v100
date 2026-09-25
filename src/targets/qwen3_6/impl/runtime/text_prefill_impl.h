@@ -1,6 +1,7 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/schedule.h"
 
+#include "core/tp_exec.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/scalar.h"
@@ -66,6 +67,10 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
                                       std::uint32_t nominal_length,
                                       std::optional<std::uint32_t> split_frontier,
                                       bool finalize_at_end) {
+    // Must run inside the body: the TP2 peer rank enqueues this chunk from its own
+    // host thread, and every thread-local TP decision (delta/sum buffers, allreduce
+    // rank, head-rank gating) keys off the device actually executing this body.
+    tpexec::bind_rank(state.execution.device);
     TextContext card(state.execution.device, state.execution.model, state.execution.work,
                      state.text_kv, state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
@@ -89,6 +94,7 @@ PrefillChunkResult prefill_multimodal_chunk(PrefillContext& state, const Prepare
                                             std::uint32_t nominal_length,
                                             std::optional<std::uint32_t> split_frontier,
                                             bool finalize_at_end) {
+    tpexec::bind_rank(state.execution.device);
     TextContext card(state.execution.device, state.execution.model, state.execution.work,
                      state.text_kv, state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,

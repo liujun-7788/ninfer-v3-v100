@@ -4,7 +4,6 @@
 
 #include "core/nvtx.h"
 #include "core/startup.h"
-#include "core/tp_exec.h"
 #include "targets/qwen3_6/impl/runtime/schedule.h"
 #include "ninfer/ops/gdn_replay.h"
 #include "ninfer/ops/linear.h"
@@ -18,14 +17,11 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
-#include <cstdio>
 #include <exception>
 #include <iterator>
 #include <limits>
-#include <optional>
 #include <stdexcept>
 #include <string>
-#include <thread>
 #include <type_traits>
 #include <utility>
 
@@ -54,55 +50,6 @@ std::int32_t checked_i32(std::uint32_t value, const char* label) {
         throw std::overflow_error(label);
     }
     return static_cast<std::int32_t>(value);
-}
-
-// TP2 runs the two ranks' eager bodies as concurrent enqueues on two host
-// threads. A single thread cannot do this: each body is thousands of kernel
-// launches, a device's pending-launch queue holds only ~1024 kernels, and each
-// rank's first allreduce spins device-side until the peer's signal kernel is
-// enqueued. While that spin holds the peer GPU idle, enqueueing the other body
-// alone fills the current device's launch queue and cudaLaunchKernel blocks
-// forever — neither body ever completes. With both bodies enqueued
-// concurrently this cannot deadlock: every allreduce publishes its own flag
-// before spinning on the peer's, so at most one GPU is ever stalled and both
-// launch queues drain. The main body's return value (if any) is produced on
-// the calling thread; a peer-body exception is rethrown after a clean join.
-template <class PeerBody, class MainBody>
-std::invoke_result_t<MainBody&> tp2_enqueue_pair(PeerBody&& peer_body, MainBody&& main_body) {
-    std::exception_ptr peer_error;
-    std::thread worker([&] {
-        try {
-            peer_body();
-        } catch (const std::exception& e) {
-            std::fprintf(stderr, "TP2TRACE tp2 pair peer body exception: %s\n", e.what());
-            peer_error = std::current_exception();
-        } catch (...) {
-            std::fprintf(stderr, "TP2TRACE tp2 pair peer body exception: unknown\n");
-            peer_error = std::current_exception();
-        }
-    });
-    if constexpr (std::is_void_v<std::invoke_result_t<MainBody&>>) {
-        try {
-            main_body();
-        } catch (...) {
-            worker.join();
-            std::rethrow_exception(std::current_exception());
-        }
-        worker.join();
-        if (peer_error != nullptr) { std::rethrow_exception(peer_error); }
-        return;
-    } else {
-        std::optional<std::invoke_result_t<MainBody&>> result;
-        try {
-            result.emplace(main_body());
-        } catch (...) {
-            worker.join();
-            std::rethrow_exception(std::current_exception());
-        }
-        worker.join();
-        if (peer_error != nullptr) { std::rethrow_exception(peer_error); }
-        return std::move(*result);
-    }
 }
 
 std::uint32_t kv_pages_for_frontier(std::uint32_t frontier) noexcept {
@@ -754,7 +701,7 @@ DecodeGraphExecutable& install_graph_profile(DecodeGraphFamily& family, DecodeGr
 
 template <class Prepare>
 void instantiate_graph_family(DecodeGraphFamily& family, const char* label, DeviceContext& device,
-                              Prepare&& prepare, bool warmup_launch = true) {
+                              Prepare&& prepare) {
     if (family.profiles.empty()) {
         throw std::logic_error(std::string(label) + " CUDA Graph family has no profiles");
     }
@@ -799,15 +746,8 @@ void instantiate_graph_family(DecodeGraphFamily& family, const char* label, Devi
                     DecodeGraphProfile& profile = family.profiles[i];
                     prepare(profile.min_execution_frontier, profile.batch_size);
                     device.synchronize();
-                    // The warm-up launch executes the graph here and now. Under tensor
-                    // parallel the graph's collectives require the peer rank to launch its
-                    // graph at the same instant, which instantiation cannot coordinate —
-                    // skip it (request-time replays run paired through the TP worker sites,
-                    // and the first replay pays the graph pool warm-up instead).
-                    if (warmup_launch) {
-                        topology.executable.launch(device.stream);
-                        device.synchronize();
-                    }
+                    topology.executable.launch(device.stream);
+                    device.synchronize();
                     continue;
                 }
                 install_and_upload(topology, i);
@@ -1127,14 +1067,13 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
                 DeviceSpan{stage.workspace_storage->base(), plan.workspace.general_capacity});
             stage.decoder =
                 std::make_unique<qwen3_6::DecoderState>(backing_s, plan.persistent.decoder);
-            // Mirror wiring must be FAN-OUT from the primary, not a chain: page-pool
-            // and execution-table propagation is one hop only, so a chain leaves
-            // stages >= 2 without replayed zeroing/copies/publications (wrong output
-            // at >= 3 pipeline stages).
-            decoder->text_kv.page_pool().add_mirror(stage.decoder->text_kv.page_pool());
-            decoder->text_kv.execution_tables().add_mirror(stage.decoder->text_kv.execution_tables());
+            qwen3_6::PagedKVCache& primary_text = s == 1 ? decoder->text_kv
+                                                        : pp_stages[s - 2].decoder->text_kv;
+            primary_text.page_pool().add_mirror(stage.decoder->text_kv.page_pool());
+            primary_text.execution_tables().add_mirror(stage.decoder->text_kv.execution_tables());
             if (qwen3_6::PagedKVCache* backend_s = stage.decoder->mtp_cache()) {
-                qwen3_6::PagedKVCache* backend_prev = backend_kv_cache();
+                qwen3_6::PagedKVCache* backend_prev =
+                    s == 1 ? backend_kv_cache() : pp_stages[s - 2].decoder->mtp_cache();
                 if (backend_prev != nullptr) {
                     backend_prev->page_pool().add_mirror(backend_s->page_pool());
                     backend_prev->execution_tables().add_mirror(backend_s->execution_tables());
@@ -1143,7 +1082,9 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
             stage.state_images =
                 std::make_unique<qwen3_6::StateImageDevicePool>(backing_s,
                                                                 plan.persistent.state_images);
-            this->state_images->add_mirror(*stage.state_images);
+            qwen3_6::StateImageDevicePool& primary_state_images =
+                s == 1 ? *this->state_images : *pp_stages[s - 2].state_images;
+            primary_state_images.add_mirror(*stage.state_images);
             if (plan.persistent.replay_records) {
                 stage.replay_records.emplace(backing_s, *plan.persistent.replay_records);
                 stage.replay_fold.emplace(*stage.replay_records,
@@ -1198,115 +1139,12 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         for (std::size_t s = 0; s + 1 < stage_count; ++s) {
             pp_link->arm_zero_wait(s, kPpSiteAckBase + s);
         }
-    } else if (seed.tp != nullptr) {
-        if (plan.features.vision) {
-            throw std::invalid_argument("Qwen3.6 tensor parallel mode does not support Vision yet");
-        }
-        if (speculative_backend == SpeculativeBackend::DFlash ||
-            speculative_backend == SpeculativeBackend::DFlash2) {
-            throw std::invalid_argument(
-                "Qwen3.6 tensor parallel mode does not support DFlash yet");
-        }
-        if (seed.stage_models.size() != 1) {
-            throw std::invalid_argument(
-                "Qwen3.6 tensor parallel seed requires exactly one peer model view");
-        }
-        // Tensor parallel keeps every layer on both ranks: rank1 mirrors rank0's physical
-        // state (same layout plans over a rank-1 backing, KV pools fan-out mirror-wired so
-        // page ids and block tables stay identical) and runs each layer on its weight shard
-        // while rank0 runs the complementary shard; an allreduce after each sharded
-        // projection reunites the activations. Unlike the pipeline seed this keeps
-        // speculative decoding available.
-        tp_group = seed.tp;
-        pp_stages.resize(1);
-        RankState& peer             = pp_stages[0];
-        DeviceContext& peer_device  = seed.tp->rank(1);
-        peer_device.bind_to_current_thread();
-        peer.persistent        = std::make_unique<DeviceArena>(plan.persistent.bytes);
-        const DeviceSpan backing_tp = peer.persistent->alloc_bytes(plan.persistent.bytes, 256);
-        peer.workspace_storage = std::make_unique<DeviceArena>(plan.workspace.capacity);
-        peer.work              = std::make_unique<WorkspaceArena>(
-            DeviceSpan{peer.workspace_storage->base(), plan.workspace.general_capacity});
-        peer.decoder = std::make_unique<qwen3_6::DecoderState>(backing_tp, plan.persistent.decoder);
-        decoder->text_kv.page_pool().add_mirror(peer.decoder->text_kv.page_pool());
-        decoder->text_kv.execution_tables().add_mirror(peer.decoder->text_kv.execution_tables());
-        if (qwen3_6::PagedKVCache* backend_tp = peer.decoder->mtp_cache()) {
-            qwen3_6::PagedKVCache* backend_prev = backend_kv_cache();
-            if (backend_prev != nullptr) {
-                backend_prev->page_pool().add_mirror(backend_tp->page_pool());
-                backend_prev->execution_tables().add_mirror(backend_tp->execution_tables());
-            }
-        }
-        peer.state_images =
-            std::make_unique<qwen3_6::StateImageDevicePool>(backing_tp,
-                                                            plan.persistent.state_images);
-        this->state_images->add_mirror(*peer.state_images);
-        if (plan.persistent.replay_records) {
-            peer.replay_records.emplace(backing_tp, *plan.persistent.replay_records);
-            peer.replay_fold.emplace(*peer.replay_records,
-                                     peer.state_images->linear().all_layers_view());
-        }
-        if (plan.persistent.mtp_lookup_replay_records) {
-            peer.mtp_lookup_replay_records.emplace(backing_tp,
-                                                   *plan.persistent.mtp_lookup_replay_records);
-            peer.mtp_lookup_replay_fold.emplace(*peer.mtp_lookup_replay_records,
-                                                peer.state_images->linear().all_layers_view());
-        }
-        peer.io.emplace(backing_tp, plan.persistent.round);
-        peer.prefill_hidden = plan.persistent.prefill_hidden.bind(backing_tp);
-        const std::size_t boundary_bytes_tp =
-            static_cast<std::size_t>(prefill_chunk) *
-            static_cast<std::size_t>(TextConfig::hidden) * 2U;
-        void* boundary_ptr_tp = nullptr;
-        CUDA_CHECK(cudaMalloc(&boundary_ptr_tp, boundary_bytes_tp));
-        peer.boundary = Tensor(boundary_ptr_tp, DType::BF16,
-                               {static_cast<std::int32_t>(TextConfig::hidden),
-                                static_cast<std::int32_t>(prefill_chunk)});
-        peer.model = seed.stage_models[0];
-        peer_device.synchronize();
-        device_in.synchronize();
-        // Install the process-local TP execution state: per-rank allreduce scratch on
-        // each rank's device (stable addresses, allocated before any graph capture) and
-        // the cross-rank peer pointers the direct path reads through P2P. The staged
-        // path needs the same sizing, so the group's staging buffers go down here too.
-        const std::size_t site_bytes_tp =
-            static_cast<std::size_t>(prefill_chunk) *
-            static_cast<std::size_t>(TextConfig::hidden) * 2U;
-        tp_group->allocate_staging(site_bytes_tp);
-        for (std::size_t r = 0; r < 2; ++r) {
-            DeviceContext& rank_device = tp_group->rank(r);
-            rank_device.bind_to_current_thread();
-            for (std::size_t site = 0; site < 2; ++site) {
-                void* delta_ptr = nullptr;
-                void* sum_ptr   = nullptr;
-                CUDA_CHECK(cudaMalloc(&delta_ptr, site_bytes_tp));
-                CUDA_CHECK(cudaMalloc(&sum_ptr, site_bytes_tp));
-                tpexec::g_delta[r][site] = delta_ptr;
-                tpexec::g_sum[r][site]   = sum_ptr;
-            }
-            rank_device.synchronize();
-        }
-        for (std::size_t r = 0; r < 2; ++r) {
-            for (std::size_t site = 0; site < 2; ++site) {
-                tpexec::g_peer_delta[r][site] = tpexec::g_delta[r ^ 1][site];
-            }
-        }
-        tpexec::g_site_rows       = TextConfig::hidden;
-        tpexec::g_site_tokens_max = static_cast<std::int32_t>(prefill_chunk);
-        tpexec::g_group           = tp_group;
-        device_in.bind_to_current_thread();
     }
 
     device.synchronize();
     if (use_cuda_graph) {
         StartupPhaseScope graph_phase(startup_observer, StartupPhase::CudaGraphPrepare);
-        try {
-            prepare_graphs();
-        } catch (const std::exception& error) {
-            std::fprintf(stderr, "TP2DIAG prepare_graphs exception: %s\n", error.what());
-            std::fflush(stderr);
-            throw;
-        }
+        prepare_graphs();
         graph_phase.complete();
     }
     work.reset();
@@ -1430,9 +1268,6 @@ std::vector<float> ProgramImplCore::causal_score(PreparedPromptData&& prompt,
                 nullptr};
             if (pp_link != nullptr) {
                 throw std::logic_error("causal scoring is not supported in pipeline mode");
-            }
-            if (tp_group != nullptr) {
-                throw std::logic_error("causal scoring is not supported in tensor parallel mode");
             }
             mark_workspace_usage(workspace_plan.text_prefill);
             const schedule::PrefillChunkResult result = schedule::prefill_text_chunk(
@@ -9292,48 +9127,8 @@ runtime::ExecutionTiming ProgramImplCore::append_forced_tokens(
                 if (is_masked_draft_backend(speculative_backend)) {
                     mark_workspace_usage(workspace_plan.dflash_context);
                 }
-                // TP2: rank1 mirrors every forced-token chunk on its weight shards —
-                // thinking-control can reach this path mid-generation, so an unpaired
-                // rank-0 body would deadlock on the first allreduce spin.
-                std::exception_ptr tp_peer_error;
-                std::thread tp_peer_worker;
-                if (tp_group != nullptr) {
-                    const std::uint32_t peer_cursor         = cursor;
-                    const std::uint32_t peer_count          = count;
-                    const StateImageSelectors peer_selectors = selectors;
-                    RankState& peer_tp                       = pp_stages[0];
-                    std::optional<schedule::PrefillContext> peer_ctx;
-                    peer_ctx.emplace(schedule::PrefillContext{
-                        {rank_core(1, peer_tp.replay_records ? &*peer_tp.replay_records : nullptr,
-                                   kPpSitePrefillBase)},
-                        text_kv_view_stage(1, sequence),
-                        mtp_kv_view_stage(1, sequence),
-                        peer_tp.decoder->text_kv,
-                        peer_tp.decoder->mtp_cache(),
-                        nullptr,
-                        peer_cursor,
-                        nullptr,
-                        nullptr,
-                        peer_selectors.source,
-                        peer_selectors.destination,
-                        0,
-                        nullptr});
-                    tp_peer_worker = std::thread([&] {
-                        try {
-                            schedule::prefill_text_chunk(*peer_ctx, sequence.ledger, peer_count,
-                                                         std::nullopt, false);
-                        } catch (...) {
-                            tp_peer_error = std::current_exception();
-                        }
-                    });
-                }
                 const schedule::PrefillChunkResult result = schedule::prefill_text_chunk(
                     schedule_state, sequence.ledger, count, std::nullopt, false);
-                if (tp_peer_worker.joinable()) {
-                    tp_peer_worker.join();
-                    device.bind_to_current_thread();
-                    if (tp_peer_error != nullptr) { std::rethrow_exception(tp_peer_error); }
-                }
                 if (result.finalized || result.processed_tokens == 0 ||
                     result.processed_tokens > count) {
                     throw std::logic_error("forced-token prefill made invalid progress");
@@ -10481,23 +10276,6 @@ runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
         timing.resume_submit();
         active_replay_fold.execute(
             std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), lanes.size()), device.stream);
-        // TP2: fold rank1's own GDN state pool too. Without this, after a partially
-        // rejected verify round rank0 rolls its recurrent state back to the accepted
-        // prefix while rank1 keeps the full draft width, and every later GDN layer
-        // on rank1 diverges (attention stays in sync because KV is mirror-wired).
-        if (tp_group != nullptr) {
-            RankState& peer_tp = pp_stages[0];
-            ops::GdnReplayFoldPlan& peer_replay_fold =
-                lookup_pending ? *peer_tp.mtp_lookup_replay_fold : *peer_tp.replay_fold;
-            // The fold launches into rank1's stream, which lives in rank1's CUDA
-            // context - the host thread must switch there or the launch fails with
-            // cudaErrorInvalidResourceHandle (same constraint as the round bodies).
-            tp_group->rank(1).bind_to_current_thread();
-            peer_replay_fold.execute(
-                std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), lanes.size()),
-                tp_group->rank(1).stream);
-            device.bind_to_current_thread();
-        }
 
         // Sparse acceptance reads counts. Publish only the prefix licensed by the Frontend.
         if (speculative_backend == SpeculativeBackend::DFlash2) {
@@ -11320,21 +11098,6 @@ schedule::ExecutionCore ProgramImplCore::rank_core(std::size_t rank, const GdnRe
                                        prefill_chunk,
                                        proposal_head};
     }
-    // TP2: rank1 executes the full 64-layer body on its own device from the mirrored peer
-    // state (pp_stages[0] under TP). All layer-range/pipeline fields stay defaulted — no
-    // layer split, no pp link — matching the replicated-weights Strategy B+ layout.
-    if (tp_group != nullptr && rank == 1) {
-        RankState& peer = pp_stages[0];
-        return schedule::ExecutionCore{tp_group->rank(1),
-                                       *peer.model,
-                                       *peer.work,
-                                       peer.state_images->linear(),
-                                       records,
-                                       *peer.io,
-                                       peer.prefill_hidden,
-                                       prefill_chunk,
-                                       proposal_head};
-    }
     if (rank >= pp_stage_count) { throw std::logic_error("pipeline stage is missing"); }
     if (rank == 0) {
         return schedule::ExecutionCore{device,
@@ -11419,26 +11182,13 @@ void ProgramImplCore::ordered_reset(SequenceState& sequence) {
 
 void ProgramImplCore::prepare_graphs() {
     if (!use_cuda_graph) { return; }
-    const std::size_t pr_count =
-        tp_group != nullptr ? 2 : (pp_link != nullptr ? pp_link->rank_count() : 1);
-    std::fprintf(stderr, "TP2DIAG prepare_graphs begin pr_count=%zu\n", pr_count);
-    std::fflush(stderr);
-    for (std::size_t pr = 0; pr < pr_count; ++pr) {
-        std::fprintf(stderr, "TP2DIAG stage %zu begin\n", pr);
-        std::fflush(stderr);
-        prepare_graphs_stage(pr);
-        std::fprintf(stderr, "TP2DIAG stage %zu done\n", pr);
-        std::fflush(stderr);
-    }
-    std::fprintf(stderr, "TP2DIAG prepare_graphs done\n");
-    std::fflush(stderr);
+    const std::size_t pr_count = pp_link != nullptr ? pp_link->rank_count() : 1;
+    for (std::size_t pr = 0; pr < pr_count; ++pr) { prepare_graphs_stage(pr); }
 }
 
 void ProgramImplCore::prepare_graphs_stage(std::size_t pr) {
     nvtx::ScopedRange prepare_range(nvtx::Name::CudaGraphPrepare, nvtx::Category::Graph);
-    DeviceContext& device = pr == 0 ? this->device
-                          : tp_group != nullptr ? tp_group->rank(pr)
-                                                : pp_link->rank(pr);
+    DeviceContext& device = pr == 0 ? this->device : pp_link->rank(pr);
     device.bind_to_current_thread();
     qwen3_6::RoundState& io = pr == 0 ? this->io : *pp_stages[pr - 1].io;
     WorkspaceArena& work = pr == 0 ? this->work : *pp_stages[pr - 1].work;
@@ -11509,8 +11259,6 @@ void ProgramImplCore::prepare_graphs_stage(std::size_t pr) {
                              "DFlash Full KV cache");
     }
     device.synchronize();
-    std::fprintf(stderr, "TP2DIAG stage %zu reserve-rows ok\n", pr);
-    std::fflush(stderr);
 
     const auto clear_stable_controls = [&] {
         std::vector<Tensor> controls{
@@ -11549,10 +11297,7 @@ void ProgramImplCore::prepare_graphs_stage(std::size_t pr) {
         zero_capture_pages(this->decoder->text_kv, *text_kv_addresses, text_capture_allocations,
                            batch_size);
         if (this->decoder->mtp_cache() != nullptr) {
-            // Zero through the PRIMARY MTP cache even on capture stages: the address store's
-            // page handles belong to the primary pool, and the mirror wiring fans the zero
-            // out to every stage's physical pages (identical page indexes).
-            zero_capture_pages(*this->decoder->mtp_cache(), *backend_kv_addresses,
+            zero_capture_pages(*decoder->mtp_cache(), *backend_kv_addresses,
                                mtp_capture_allocations, batch_size);
         }
         if (dflash && dflash->full) {
@@ -11650,34 +11395,6 @@ void ProgramImplCore::prepare_graphs_stage(std::size_t pr) {
     const auto execution_core = [&](const GdnReplayRecords* records) {
         return rank_core(pr, records, kPpSiteVerifyBase);
     };
-    // TP warm runs: the two ranks' eager warm bodies are enqueued concurrently
-    // by two host threads (tp2_enqueue_pair) so neither device's launch queue
-    // starves while the peer spins at its first allreduce. The peer's integer
-    // controls must be zeroed first — its RoundState is fresh and a warm body
-    // would otherwise gather embeddings through garbage token ids.
-    const auto tp_peer_warm_begin = [&] {
-        RankState& peer_tp            = pp_stages[0];
-        DeviceContext& peer_device_tp = tp_group->rank(1);
-        qwen3_6::RoundState& peer_io  = *peer_tp.io;
-        std::vector<Tensor> controls{
-            peer_io.token,
-            peer_io.pos,
-            peer_io.rope_pos,
-            peer_io.rope_delta,
-        };
-        if (peer_io.mtp) {
-            controls.push_back(peer_io.mtp->position);
-            controls.push_back(peer_io.mtp->draft_tokens);
-            controls.push_back(peer_io.mtp->target_input_ids);
-            controls.push_back(peer_io.mtp->target_positions);
-        }
-        for (const Tensor& tensor : controls) {
-            CUDA_CHECK(cudaMemsetAsync(tensor.data, 0, tensor.bytes(), peer_device_tp.stream));
-        }
-        peer_device_tp.bind_to_current_thread();
-        return &peer_tp;
-    };
-    const auto tp_peer_warm_end = [&] { device.bind_to_current_thread(); };
 
     if (speculative_backend == SpeculativeBackend::None) {
         const auto ordinary_profiles = ordinary_graph_profiles(capacity);
@@ -11690,33 +11407,9 @@ void ProgramImplCore::prepare_graphs_stage(std::size_t pr) {
         const GraphExecutionProfile code_warm = ordinary_profiles.front();
         prepare_representative(code_warm.min, 1);
         device.synchronize();
-        if (tp_group == nullptr || pr == 0) {
-            if (tp_group != nullptr) {
-                tp2_enqueue_pair(
-                    [&] {
-                        RankState* peer_tp = tp_peer_warm_begin();
-                        schedule::OrdinaryBatchContext peer_state{
-                            rank_core(1, nullptr, kPpSiteVerifyBase), peer_tp->decoder->text_kv,
-                            *peer_tp->io->ordinary, *ordinary_host_ingress,
-                            *ordinary_host_egress,  peer_tp->state_images->continuation_hidden_store()};
-                        schedule::ordinary_decode_batch(peer_state, 1,
-                                                        {code_warm.min + 1, code_warm.max + 1},
-                                                        nullptr);
-                    },
-                    [&] {
-                        schedule::ordinary_decode_batch(ordinary_state, 1,
-                                                        {code_warm.min + 1, code_warm.max + 1},
-                                                        nullptr);
-                    });
-                tp_peer_warm_end();
-                device.synchronize();
-                tp_group->rank(1).synchronize();
-            } else {
-                schedule::ordinary_decode_batch(ordinary_state, 1,
-                                                {code_warm.min + 1, code_warm.max + 1}, nullptr);
-                device.synchronize();
-            }
-        }
+        schedule::ordinary_decode_batch(ordinary_state, 1, {code_warm.min + 1, code_warm.max + 1},
+                                        nullptr);
+        device.synchronize();
 
         ordinary_graphs.profiles.reserve(ordinary_profiles.size() * ordinary_batch_limit);
         for (std::uint32_t batch_size = 1; batch_size <= ordinary_batch_limit; ++batch_size) {
@@ -11750,61 +11443,15 @@ void ProgramImplCore::prepare_graphs_stage(std::size_t pr) {
         const GraphExecutionProfile code_warm = planned_profiles.front();
         prepare_representative(code_warm.min, 1);
         device.synchronize();
-        if (tp_group == nullptr || pr == 0) {
-            if (tp_group != nullptr) {
-                std::fprintf(stderr, "TP2DIAG warm pair begin\n");
-                std::fflush(stderr);
-                tp2_enqueue_pair(
-                    [&] {
-                        RankState* peer_tp = tp_peer_warm_begin();
-                        std::fprintf(stderr, "TP2DIAG warm peer begin done\n");
-                        std::fflush(stderr);
-                        schedule::MtpBatchContext peer_state{
-                            rank_core(1, &*peer_tp->replay_records, kPpSiteVerifyBase),
-                            peer_tp->decoder->text_kv,
-                            *peer_tp->decoder->mtp_cache(),          *peer_tp->io->mtp_decode,
-                            *mtp_host_ingress,                       *mtp_host_egress,
-                            peer_tp->state_images->continuation_hidden_store()};
-                        schedule::mtp_decode_batch(
-                            peer_state, 1, draft_window, draft_window,
-                            mtp_causal_attention_envelopes(code_warm.max, draft_window,
-                                                           draft_window, capacity),
-                            nullptr);
-                        std::fprintf(stderr, "TP2DIAG warm peer body returned\n");
-                        std::fflush(stderr);
-                    },
-                    [&] {
-                        schedule::mtp_decode_batch(
-                            mtp_state, 1, draft_window, draft_window,
-                            mtp_causal_attention_envelopes(code_warm.max, draft_window,
-                                                           draft_window, capacity),
-                            nullptr);
-                        std::fprintf(stderr, "TP2DIAG warm rank0 body returned\n");
-                        std::fflush(stderr);
-                    });
-                tp_peer_warm_end();
-                device.synchronize();
-                std::fprintf(stderr, "TP2DIAG warm rank0 sync done\n");
-                std::fflush(stderr);
-                tp_group->rank(1).synchronize();
-                std::fprintf(stderr, "TP2DIAG warm peer sync done\n");
-                std::fflush(stderr);
-            } else {
-                schedule::mtp_decode_batch(
-                    mtp_state, 1, draft_window, draft_window,
-                    mtp_causal_attention_envelopes(code_warm.max, draft_window, draft_window,
-                                                   capacity),
-                    nullptr);
-            }
-        }
-        std::fprintf(stderr, "TP2DIAG stage %zu mtp warm ok\n", pr);
-        std::fflush(stderr);
+        schedule::mtp_decode_batch(
+            mtp_state, 1, draft_window, draft_window,
+            mtp_causal_attention_envelopes(code_warm.max, draft_window, draft_window, capacity),
+            nullptr);
+        device.synchronize();
 
         mtp_graphs.profiles.reserve(planned_profiles.size() * max_concurrency);
         for (std::uint32_t batch_size = 1; batch_size <= max_concurrency; ++batch_size) {
             for (const GraphExecutionProfile planned : planned_profiles) {
-                std::fprintf(stderr, "TP2DIAG cap mtp b=%u min=%u\n", batch_size, planned.min);
-                std::fflush(stderr);
                 mtp_graphs.profiles.emplace_back();
                 DecodeGraphProfile& profile    = mtp_graphs.profiles.back();
                 profile.batch_size             = batch_size;
@@ -11837,8 +11484,6 @@ void ProgramImplCore::prepare_graphs_stage(std::size_t pr) {
         mtp_lookup_graphs.profiles.reserve(lookup_profiles.size() * max_concurrency);
         for (std::uint32_t batch_size = 1; batch_size <= max_concurrency; ++batch_size) {
             for (const GraphExecutionProfile planned : lookup_profiles) {
-                std::fprintf(stderr, "TP2DIAG cap lookup b=%u min=%u\n", batch_size, planned.min);
-                std::fflush(stderr);
                 mtp_lookup_graphs.profiles.emplace_back();
                 DecodeGraphProfile& profile    = mtp_lookup_graphs.profiles.back();
                 profile.batch_size             = batch_size;
@@ -11904,20 +11549,15 @@ void ProgramImplCore::prepare_graphs_stage(std::size_t pr) {
     }
 
     if (!ordinary_graphs.profiles.empty()) {
-        std::fprintf(stderr, "TP2DIAG stage %zu instantiate begin\n", pr);
-        std::fflush(stderr);
-        instantiate_graph_family(ordinary_graphs, "ordinary", device, prepare_representative,
-                                 tp_group == nullptr);
+        instantiate_graph_family(ordinary_graphs, "ordinary", device, prepare_representative);
     }
     if (speculative_backend == SpeculativeBackend::Mtp) {
-        instantiate_graph_family(mtp_graphs, "MTP", device, prepare_representative,
-                                 tp_group == nullptr);
+        instantiate_graph_family(mtp_graphs, "MTP", device, prepare_representative);
         instantiate_graph_family(mtp_lookup_graphs, "MTP lookup", device,
-                                 prepare_representative, tp_group == nullptr);
+                                 prepare_representative);
     }
     if (is_masked_draft_backend(speculative_backend)) {
-        instantiate_graph_family(dflash_graphs, "DFlash", device, prepare_representative,
-                                 tp_group == nullptr);
+        instantiate_graph_family(dflash_graphs, "DFlash", device, prepare_representative);
     }
 
     clear_stable_controls();
@@ -12165,28 +11805,6 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                     nullptr});
             }
         }
-        // TP2: rank1 mirrors every prefill chunk on its weight shards. Both bodies carry the
-        // same allreduce call sequence, so they must be enqueued back-to-back per chunk.
-        std::optional<schedule::PrefillContext> tp_peer_ctx;
-        if (tp_group != nullptr) {
-            RankState& peer_tp = pp_stages[0];
-            tp_peer_ctx.emplace(schedule::PrefillContext{
-                {rank_core(1, peer_tp.replay_records ? &*peer_tp.replay_records : nullptr,
-                           kPpSitePrefillBase)},
-                text_kv_view_stage(1, sequence),
-                mtp_kv_view_stage(1, sequence),
-                peer_tp.decoder->text_kv,
-                peer_tp.decoder->mtp_cache(),
-                nullptr,
-                staged.cursor,
-                static_cast<const ops::SamplingConfig*>(
-                    sampling_config.slice(1, static_cast<std::int32_t>(sequence.lane), 1).data),
-                nullptr,
-                selectors.source,
-                selectors.destination,
-                staged.initial_mtp_extent,
-                nullptr});
-        }
 
         if (staged.mtp_bridge == MtpBridgeMode::BeforeSuffix) {
             if (pp_link != nullptr) {
@@ -12268,38 +11886,6 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                                                                 *staged.vision, remaining,
                                                                 split_frontier, final_candidate);
                 } else {
-                    // The peer rank's chunk body is enqueued on a dedicated thread
-                    // concurrently with rank 0's (tp2_enqueue_pair rationale): both
-                    // bodies are thousands of launches and each rank's first allreduce
-                    // spins device-side until the peer's signal is enqueued.
-                    std::exception_ptr tp_peer_error;
-                    std::thread tp_peer_worker;
-                    if (tp_group != nullptr) {
-                        const auto peer_text_kv_base = schedule_state.text_kv_base;
-                        const auto peer_source_slot  = schedule_state.state_source_slot;
-                        const auto peer_destination_slot =
-                            schedule_state.state_destination_slot;
-                        const auto peer_remaining                     = remaining;
-                        const std::optional<std::uint32_t> peer_split = split_frontier;
-                        const bool peer_final                         = final_candidate;
-                        tp_peer_worker                                = std::thread([&] {
-                            try {
-                                tp_peer_ctx->text_kv_base           = peer_text_kv_base;
-                                tp_peer_ctx->state_source_slot      = peer_source_slot;
-                                tp_peer_ctx->state_destination_slot = peer_destination_slot;
-                                // The rewrite checkpoint slot is rank 0's capture buffer;
-                                // rank 1 skips that copy instead of racing rank 0's write.
-                                tp_peer_ctx->rewrite_checkpoint_hidden = nullptr;
-                                tp_group->rank(1).bind_to_current_thread();
-                                schedule::prefill_text_chunk(
-                                    *tp_peer_ctx,
-                                    std::span<const TokenId>(staged.prompt.token_ids),
-                                    peer_remaining, peer_split, peer_final);
-                            } catch (...) {
-                                tp_peer_error = std::current_exception();
-                            }
-                        });
-                    }
                     for (std::size_t s = 0; s < pp_stage_total; ++s) {
                         if (pp_link != nullptr) {
                             if (s + 1 < pp_stage_total) {
@@ -12336,13 +11922,6 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                         }
                     }
                     if (pp_link != nullptr) { pp_link->rank(0).bind_to_current_thread(); }
-                    if (tp_peer_worker.joinable()) {
-                        tp_peer_worker.join();
-                        device.bind_to_current_thread();
-                        if (tp_peer_error != nullptr) {
-                            std::rethrow_exception(tp_peer_error);
-                        }
-                    }
                 }
                 timing.include(result.timing);
                 timing.resume_post();
@@ -12560,13 +12139,6 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
                     stage_executables[s - 1] = &install_graph_profile(
                         pp_stages[s - 1].ordinary_graphs, stage_profile, "ordinary batch");
                 }
-            } else if (tp_group != nullptr) {
-                stage_executables.assign(1, nullptr);
-                DecodeGraphProfile& stage_profile = select_graph_profile(
-                    pp_stages[0].ordinary_graphs, static_cast<std::uint32_t>(lanes.size()),
-                    maximum_frontier, "ordinary batch");
-                stage_executables[0] = &install_graph_profile(pp_stages[0].ordinary_graphs,
-                                                              stage_profile, "ordinary batch");
             }
         }
 
@@ -12596,8 +12168,7 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
                                                       state_images->continuation_hidden_store()};
 
         mark_workspace_usage(workspace_plan.ordinary_round);
-        const std::size_t pp_stage_total =
-            pp_link != nullptr ? pp_link->rank_count() : (tp_group != nullptr ? 2 : 1);
+        const std::size_t pp_stage_total = pp_link != nullptr ? pp_link->rank_count() : 1;
         std::vector<schedule::OrdinaryBatchContext> stage_ctxs;
         if (pp_link != nullptr) {
             for (std::size_t s = 1; s < pp_stage_total; ++s) {
@@ -12609,63 +12180,26 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
                     *ordinary_host_egress,
                     pp_stages[s - 1].state_images->continuation_hidden_store()});
             }
-        } else if (tp_group != nullptr) {
-            stage_ctxs.emplace_back(schedule::OrdinaryBatchContext{
-                {rank_core(1, nullptr, kPpSiteVerifyBase)},
-                pp_stages[0].decoder->text_kv,
-                *pp_stages[0].io->ordinary,
-                *ordinary_host_ingress,
-                *ordinary_host_egress,
-                pp_stages[0].state_images->continuation_hidden_store()});
         }
-        if (tp_group != nullptr) {
-            // Rank 1's body is enqueued on a dedicated thread concurrently with
-            // rank 0's (tp2_enqueue_pair): a single thread cannot feed both
-            // devices' launch queues while the peer spins at its first allreduce.
-            std::exception_ptr tp_stage_error;
-            std::thread tp_stage_worker([&] {
-                try {
-                    tp_group->rank(1).bind_to_current_thread();
-                    schedule::ordinary_decode_batch(
-                        stage_ctxs[0], static_cast<std::int32_t>(lanes.size()), envelope,
-                        stage_executables.empty() ? nullptr : stage_executables[0]);
-                } catch (...) {
-                    tp_stage_error = std::current_exception();
-                }
-            });
-            schedule::ordinary_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
-                                            envelope, executable);
-            tp_stage_worker.join();
-            device.bind_to_current_thread();
-            if (tp_stage_error != nullptr) { std::rethrow_exception(tp_stage_error); }
-        } else {
-            for (std::size_t s = 0; s < pp_stage_total; ++s) {
-                if (pp_link != nullptr) {
-                    if (s + 1 < pp_stage_total) { pp_link->wait_done(s, kPpSiteAckBase + s); }
-                    pp_link->rank(s).bind_to_current_thread();
-                }
-                if (s == 0) {
-                    schedule::ordinary_decode_batch(schedule_state,
-                                                    static_cast<std::int32_t>(lanes.size()),
-                                                    envelope, executable);
-                } else {
-                    schedule::ordinary_decode_batch(
-                        stage_ctxs[s - 1], static_cast<std::int32_t>(lanes.size()), envelope,
-                        stage_executables.empty() ? nullptr : stage_executables[s - 1]);
-                }
-                if (pp_link != nullptr && s > 0) {
-                    pp_link->signal_done(s, kPpSiteAckBase + s - 1);
-                }
+        for (std::size_t s = 0; s < pp_stage_total; ++s) {
+            if (pp_link != nullptr) {
+                if (s + 1 < pp_stage_total) { pp_link->wait_done(s, kPpSiteAckBase + s); }
+                pp_link->rank(s).bind_to_current_thread();
+            }
+            if (s == 0) {
+                schedule::ordinary_decode_batch(schedule_state,
+                                                static_cast<std::int32_t>(lanes.size()),
+                                                envelope, executable);
+            } else {
+                schedule::ordinary_decode_batch(
+                    stage_ctxs[s - 1], static_cast<std::int32_t>(lanes.size()), envelope,
+                    stage_executables.empty() ? nullptr : stage_executables[s - 1]);
+            }
+            if (pp_link != nullptr && s > 0) {
+                pp_link->signal_done(s, kPpSiteAckBase + s - 1);
             }
         }
         if (pp_link != nullptr) { pp_link->rank(0).bind_to_current_thread(); }
-        if (tp_group != nullptr) { device.bind_to_current_thread(); }
-        if (pp_link != nullptr) {
-            // The egress D2H copy is enqueued on the last stage's stream, which
-            // the rank-0 device.synchronize() below never covers; sync it before
-            // the host reads this round's sampled tokens.
-            CUDA_CHECK(cudaStreamSynchronize(stage_ctxs.back().execution.device.stream));
-        }
         if (std::getenv("NINFER_PP_DEBUG") != nullptr) {
             std::fprintf(stderr, "[PP] round: ingress_tok=%u egress_tok=%u\n",
                          static_cast<unsigned>(ordinary_host_ingress->tokens[0]),
@@ -12870,53 +12404,8 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                                                  state_images->continuation_hidden_store()};
 
         mark_workspace_usage(workspace_plan.mtp_round);
-        if (tp_group != nullptr) {
-            // Rank 1 mirrors the whole MTP round — draft (redundant, full weights) and
-            // verify (sharded with allreduces). The two bodies are enqueued by two
-            // host threads (tp2_enqueue_pair) so neither device's launch queue
-            // starves while the peer spins at an allreduce.
-            RankState& peer_tp              = pp_stages[0];
-            qwen3_6::MtpDecodeState& peer_frame =
-                use_lookup ? *peer_tp.io->mtp_lookup_decode : *peer_tp.io->mtp_decode;
-            DecodeGraphExecutable* peer_executable = nullptr;
-            if (use_cuda_graph) {
-                DecodeGraphProfile& peer_profile = select_graph_profile(
-                    use_lookup ? peer_tp.mtp_lookup_graphs : peer_tp.mtp_graphs,
-                    static_cast<std::uint32_t>(lanes.size()), maximum_frontier, "MTP batch");
-                peer_executable = &install_graph_profile(
-                    use_lookup ? peer_tp.mtp_lookup_graphs : peer_tp.mtp_graphs, peer_profile,
-                    "MTP batch");
-            }
-            schedule::MtpBatchContext peer_state{
-                {rank_core(1, use_lookup ? &*peer_tp.mtp_lookup_replay_records
-                                         : &*peer_tp.replay_records,
-                           kPpSiteVerifyBase)},
-                peer_tp.decoder->text_kv,
-                *peer_tp.decoder->mtp_cache(),
-                peer_frame,
-                *mtp_host_ingress,
-                *mtp_host_egress,
-                peer_tp.state_images->continuation_hidden_store()};
-            tp2_enqueue_pair(
-                [&] {
-                    // The worker thread is fresh: its current CUDA device is still
-                    // dev0, so every kernel/graph launch below would target rank1's
-                    // streams from the wrong context (cudaErrorInvalidResourceHandle
-                    // eager, silently corrupted graphs otherwise).
-                    tp_group->rank(1).bind_to_current_thread();
-                    schedule::mtp_decode_batch(peer_state, static_cast<std::int32_t>(lanes.size()),
-                                               verify_k, proposal_k, envelopes, peer_executable);
-                },
-                [&] {
-                    schedule::mtp_decode_batch(schedule_state,
-                                               static_cast<std::int32_t>(lanes.size()), verify_k,
-                                               proposal_k, envelopes, executable);
-                });
-            device.bind_to_current_thread();
-        } else {
-            schedule::mtp_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
-                                       verify_k, proposal_k, envelopes, executable);
-        }
+        schedule::mtp_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
+                                   verify_k, proposal_k, envelopes, executable);
         submit_range.reset();
         timing.begin_wait();
         {

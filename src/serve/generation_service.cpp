@@ -236,6 +236,7 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.artifact_path            = options_.artifact_path;
     engine_options.device                   = options_.device;
     engine_options.pp_devices               = options_.pp_devices;
+    engine_options.tp_devices               = options_.tp_devices;
     engine_options.max_context              = options_.max_context;
     engine_options.kv_capacity              = options_.kv_capacity;
     engine_options.max_concurrency          = options_.max_concurrency;

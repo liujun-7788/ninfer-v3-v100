@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+#include <cstdio>
 #include "core/paged_kv_cache.h"
 
 #include <algorithm>
@@ -1450,6 +1452,12 @@ public:
                 " entitlement=" + std::to_string(entitlement(address)));
         }
         if (target <= address.page_count) { return; }
+        static std::atomic<int> kvens_n{0};
+        if (kvens_n.fetch_add(1) % 32 == 0) {
+            std::fprintf(stderr, "KVENS tokens=%u newpages=%u mapped=%u\n", tokens,
+                         target - address.page_count, address.page_count);
+            std::fflush(stderr);
+        }
         const std::uint32_t begin       = address.page_count;
         const std::uint32_t count       = target - begin;
         const std::size_t address_index = static_cast<std::size_t>(&address - addresses_.data());

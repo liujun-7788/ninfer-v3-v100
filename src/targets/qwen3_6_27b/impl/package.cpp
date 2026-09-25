@@ -3,7 +3,9 @@
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 
 #include "artifact/reader.h"
+#include "core/tp_group.h"
 #include "targets/qwen3_6_27b/impl/load/bindings.h"
+#include "targets/qwen3_6_27b/impl/load/tp_shard.h"
 #include "targets/qwen3_6_27b/impl/variant.h"
 
 #include <stdexcept>
@@ -107,9 +109,11 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
 
 Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptions& options,
                                      WeightsProfile weights_profile) {
-    return LoadPlan(std::make_unique<LoadPlan::Impl>(
+    std::unique_ptr<LoadPlan::Impl> impl = std::make_unique<LoadPlan::Impl>(
         weights_profile,
-        detail::bind_artifact(binder, weights_profile, qwen3_6::startup_features(options))));
+        detail::bind_artifact(binder, weights_profile, qwen3_6::startup_features(options)));
+    if (options.tp_devices.size() == 2) { detail::mark_tp_shard(impl->plan.bindings); }
+    return LoadPlan(std::move(impl));
 }
 
 std::unique_ptr<Package::LoadedModel>
@@ -147,6 +151,7 @@ std::unique_ptr<Package::Program> Package::create_program(const LoadedModel& mod
     if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
     qwen3_6::ProgramPipelineSeed<detail::Variant> seed;
     seed.pp = pipeline.pp;
+    seed.tp = pipeline.tp;
     seed.stage_models.reserve(pipeline.stage_models.size());
     for (const LoadedModel* model : pipeline.stage_models) {
         seed.stage_models.push_back(&model->impl_->data.runtime);
@@ -154,6 +159,15 @@ std::unique_ptr<Package::Program> Package::create_program(const LoadedModel& mod
     return qwen3_6::create_program<detail::Variant>(model.impl_->data.runtime,
                                                     model.impl_->weights_profile, std::move(plan),
                                                     device, startup_observer, seed);
+}
+
+void Package::tp_shard_loaded_model(const LoadedModel& model, TpGroup& tp, int rank) {
+    if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
+    if (rank < 0 || rank >= static_cast<int>(tp.rank_count())) {
+        throw std::out_of_range("tp shard rank is out of range");
+    }
+    tp.rank(static_cast<std::size_t>(rank)).bind_to_current_thread();
+    detail::tp_shard_model(model.impl_->data.runtime, rank);
 }
 
 } // namespace ninfer::targets::qwen3_6_27b

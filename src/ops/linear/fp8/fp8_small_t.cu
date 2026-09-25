@@ -77,6 +77,21 @@ void launch_fp8_small_t(const Tensor& x, const Weight& weight, Tensor& out, cuda
     case Fp8Problem::Residual17408:
         launch_registered<Fp8Residual17408Geometry>(x, weight, out, stream);
         return;
+    case Fp8Problem::AttnInputShard:
+        launch_registered<Fp8AttnInputShardGeometry>(x, weight, out, stream);
+        return;
+    case Fp8Problem::GdnInputShard:
+        launch_registered<Fp8GdnInputShardGeometry>(x, weight, out, stream);
+        return;
+    case Fp8Problem::MlpGateUpShard:
+        launch_registered<Fp8MlpGateUpShardGeometry>(x, weight, out, stream);
+        return;
+    case Fp8Problem::OutProjShard:
+        launch_registered<Fp8OutProjShardGeometry>(x, weight, out, stream);
+        return;
+    case Fp8Problem::DownShard:
+        launch_registered<Fp8DownShardGeometry>(x, weight, out, stream);
+        return;
     }
     throw std::logic_error("FP8 vocabulary small-T uses its A16 MMA route");
 }
