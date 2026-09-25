@@ -83,7 +83,10 @@ struct ModelConfig {
 
 inline int tp2_heads_div() {
     const char* e = std::getenv("NINFER_TP2_SHARD");
-    return (e != nullptr && std::string_view(e) == "heads") ? 2 : 1;
+    return (e != nullptr &&
+            (std::string_view(e) == "heads" || std::string_view(e) == "heads_mlp"))
+               ? 2
+               : 1;
 }
 inline const ModelConfig kCfg{TextConfig::query_heads / tp2_heads_div(),
                               TextConfig::kv_heads / tp2_heads_div()};

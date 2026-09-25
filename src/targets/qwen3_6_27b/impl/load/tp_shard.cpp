@@ -393,17 +393,18 @@ void tp_shard_model(RuntimeModelView& runtime, int rank) {
     // regrouped gate|up per rank) and MLP down (K-split to 8704). Fused input projections,
     // attention/GDN cores, conv states, control heads, embeddings, the lm_head and all MTP
     // draft weights stay FULL (replicated) on both ranks.
-    // Bisect switch: NINFER_TP2_SHARD=all (default) | none | outproj | mlp.
+    // Bisect switch: NINFER_TP2_SHARD=all (default) | none | outproj | mlp | heads | heads_mlp.
     // "none" leaves every weight full so both ranks run identical replicated compute and
     // none of the TP2 allreduce branches fire; "outproj"/"mlp" isolate one producer site.
     const char* shard_env = std::getenv("NINFER_TP2_SHARD");
     const std::string_view shard_mode =
         shard_env == nullptr ? std::string_view("all") : std::string_view(shard_env);
     const bool shard_out = shard_mode == "all" || shard_mode == "outproj";
-    const bool shard_mlp = shard_mode == "all" || shard_mode == "mlp";
+    const bool shard_mlp =
+        shard_mode == "all" || shard_mode == "mlp" || shard_mode == "heads_mlp";
     const bool shard_gu   = shard_mode == "gu";
     const bool shard_down = shard_mode == "down";
-    const bool shard_heads = shard_mode == "heads";
+    const bool shard_heads = shard_mode == "heads" || shard_mode == "heads_mlp";
     if (shard_heads) {
         // Attention head-split (weights only; the head-offset forward is a separate change).
         // Fused QKV [14336] = q[0:6144] | key[6144:7168] | gate[7168:13312] | value[13312:14336]
@@ -428,7 +429,8 @@ void tp_shard_model(RuntimeModelView& runtime, int rank) {
                           "attention output");
             prepack_sharded(layer.output, false);
         }
-        return;
+        // heads_mlp falls through to the post_mixer sharding below; pure "heads" skips it
+        // because every shard_* flag except shard_heads is false.
     }
     if (shard_out || shard_mlp || shard_gu || shard_down) {
         for (FullAttentionWeights& layer : runtime.full_layers) {

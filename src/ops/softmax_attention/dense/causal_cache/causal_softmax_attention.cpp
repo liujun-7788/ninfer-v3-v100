@@ -282,7 +282,8 @@ struct SmallTWorkspace {
 bool volta_flash_route_possible(std::int32_t q_heads, std::int32_t width,
                                 std::int32_t batch_size, KvCacheStorage cache_storage) {
     const bool supported_geometry = q_heads == CausalD256H24Kv4::QHeads ||
-                                    q_heads == CausalD256H16Kv2::QHeads;
+                                    q_heads == CausalD256H16Kv2::QHeads ||
+                                    q_heads == CausalD256H12Kv2::QHeads;
     return supported_geometry && batch_size == 1 &&
            (cache_storage == KvCacheStorage::BFloat16 ||
             cache_storage == KvCacheStorage::Int8Group64) &&

@@ -67,6 +67,12 @@ struct VoltaFlashTiling<CausalD256H16Kv2> {
     static constexpr int ncols1 = 4;
 };
 
+template <>
+struct VoltaFlashTiling<CausalD256H12Kv2> {
+    static constexpr int ncols2 = 2;
+    static constexpr int ncols1 = 16;
+};
+
 template <typename Geometry>
 struct VoltaFlashParams {
     static constexpr int kQHeads  = Geometry::QHeads;
@@ -578,11 +584,13 @@ void volta_flash_launch_impl(const Tensor& q, const Tensor& k, const Tensor& v,
 
 } // namespace
 
-// The two registered geometries differ only in tiling; both are instantiated so
-// the route can serve 27B (24q/4kv) and 35B-A3B (16q/2kv) from one launcher.
+// The registered geometries differ only in tiling; all are instantiated so
+// the route can serve 27B (24q/4kv), 35B-A3B (16q/2kv) and the TP2 head-split
+// 27B (12q/2kv) from one launcher.
 std::size_t causal_attention_volta_flash_meta_elements(std::int32_t q_heads, std::int32_t tokens) {
     if (q_heads == CausalD256H24Kv4::QHeads) { return meta_elements_impl<CausalD256H24Kv4>(tokens); }
     if (q_heads == CausalD256H16Kv2::QHeads) { return meta_elements_impl<CausalD256H16Kv2>(tokens); }
+    if (q_heads == CausalD256H12Kv2::QHeads) { return meta_elements_impl<CausalD256H12Kv2>(tokens); }
     throw std::invalid_argument("gqa_attention volta flash: unsupported Q head geometry");
 }
 
@@ -601,6 +609,12 @@ void causal_attention_volta_flash_launch(const Tensor& q, const Tensor& k, const
     }
     if (q.ne[1] == CausalD256H16Kv2::QHeads) {
         volta_flash_launch_impl<CausalD256H16Kv2>(q, k, v, positions, table_rows, scale, cache,
+                                               envelope, q_block_tokens, k_gathered, v_gathered,
+                                               mask, q_f32, out_f32, dst_meta, out, stream);
+        return;
+    }
+    if (q.ne[1] == CausalD256H12Kv2::QHeads) {
+        volta_flash_launch_impl<CausalD256H12Kv2>(q, k, v, positions, table_rows, scale, cache,
                                                envelope, q_block_tokens, k_gathered, v_gathered,
                                                mask, q_f32, out_f32, dst_meta, out, stream);
         return;
