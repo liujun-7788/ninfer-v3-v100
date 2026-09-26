@@ -274,8 +274,10 @@ void Variant::mtp_q_gate_projection(const Tensor& hidden,
 void Variant::gdn_input_projection(const Tensor& hidden, const GdnProjectionWeights& weights,
                                    Tensor& qkv, Tensor& output_gate, qwen3_6::TextPhase,
                                    WorkspaceArena& workspace, cudaStream_t stream) {
+    // Row count follows the caller's (possibly TP2 head-split) buffer, not the full config.
     Tensor output_gate_flat =
-        output_gate.view({TextConfig::value_dim, static_cast<int>(hidden.ne[1])});
+        output_gate.view({static_cast<int>(output_gate.numel() / hidden.ne[1]),
+                          static_cast<int>(hidden.ne[1])});
     if (const auto* split =
             std::get_if<SplitGdnInputProjectionPayload>(&weights.input_projection)) {
         ops::gdn_input_proj(hidden, split->query_key, split->value_z, qkv, output_gate_flat,
@@ -296,7 +298,9 @@ void Variant::gdn_input_projection_snapshot(
     auto workspace_scope     = workspace.scope();
     const DeviceSpan storage = workspace.alloc_bytes(gdn_snapshot_workspace_bytes(hidden, weights));
     WorkspaceArena leaf_workspace(storage);
-    Tensor output_gate_view = output_gate.view({TextConfig::value_dim, hidden.ne[1], hidden.ne[2]});
+    Tensor output_gate_view =
+        output_gate.view({static_cast<int>(output_gate.numel() / (hidden.ne[1] * hidden.ne[2])),
+                          hidden.ne[1], hidden.ne[2]});
     if (const auto* split =
             std::get_if<SplitGdnInputProjectionPayload>(&weights.input_projection)) {
         ops::gdn_input_proj_conv_snapshot(hidden, split->query_key, split->value_z, conv_weight,
@@ -321,7 +325,9 @@ void Variant::gdn_input_projection_record(const Tensor& hidden, const GdnProject
     auto workspace_scope     = workspace.scope();
     const DeviceSpan storage = workspace.alloc_bytes(gdn_record_workspace_bytes(hidden, weights));
     WorkspaceArena leaf_workspace(storage);
-    Tensor output_gate_view = output_gate.view({TextConfig::value_dim, hidden.ne[1], hidden.ne[2]});
+    Tensor output_gate_view =
+        output_gate.view({static_cast<int>(output_gate.numel() / (hidden.ne[1] * hidden.ne[2])),
+                          hidden.ne[1], hidden.ne[2]});
     if (const auto* split =
             std::get_if<SplitGdnInputProjectionPayload>(&weights.input_projection)) {
         ops::gdn_input_proj_conv_record(hidden, split->query_key, split->value_z, conv_weight,
@@ -341,10 +347,14 @@ void Variant::gdn_output_projection(const Tensor& hidden, const Weight& weight, 
                                     qwen3_6::TextPhase, WorkspaceArena& workspace,
                                     cudaStream_t stream) {
     // TP2: same site-0 allreduce as the attention out projection (only one of the two runs
-    // per layer, so they share the site and the parity counter).
+    // per layer, so they share the site and the parity counter). Heads mode already produces
+    // exactly this rank's half (rows == weight.k), so no staging is needed there.
     if (tpexec::active() && weight.k == 3072) {
         const int tokens = hidden.ne[1];
-        Tensor input     = tp2_stage_k_half(hidden, weight.k, tokens, workspace, stream);
+        const int rows   = static_cast<int>(hidden.numel()) / tokens;
+        Tensor input     = rows == weight.k
+                               ? hidden.view({weight.k, tokens})
+                               : tp2_stage_k_half(hidden, weight.k, tokens, workspace, stream);
         Tensor delta     = tpexec::site_delta(0, tokens);
         ops::linear(input, weight, delta, text_policy(weight), workspace, stream);
         tpexec::allreduce_bf16(0, tokens);

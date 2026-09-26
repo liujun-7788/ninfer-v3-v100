@@ -19,8 +19,8 @@ void launch_exact(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
     using Schedule = typename Fp8LinearSmallTProductionSchedule<Geometry, ActiveTokens>::Type;
     constexpr int kTokenTiles = (ActiveTokens + Schedule::kTokenTile - 1) / Schedule::kTokenTile;
     constexpr int kBlocks     = (Geometry::kOutputRows / Schedule::kRowsPerCta) * kTokenTiles;
-    const Fp8GdnInputOutput output{static_cast<__nv_bfloat16*>(qkv.data),
-                                   static_cast<__nv_bfloat16*>(z.data)};
+    const Fp8GdnInputOutput<Geometry> output{static_cast<__nv_bfloat16*>(qkv.data),
+                                             static_cast<__nv_bfloat16*>(z.data)};
     fp8_small_t_kernel<Geometry, ActiveTokens, Schedule>
         <<<kBlocks, Schedule::kThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data),
@@ -34,9 +34,9 @@ void launch_small_mma(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor
                       cudaStream_t stream) {
     constexpr int warps = Capacity <= 8 ? 16 : Capacity <= 24 ? 8 : 4;
     using Schedule = Fp8A16SmallTMmaSchedule<warps, Capacity, warps == 16 ? 1 : 2>;
-    const Fp8GdnInputOutput output{static_cast<__nv_bfloat16*>(qkv.data),
-                                  static_cast<__nv_bfloat16*>(z.data)};
-    fp8_a16_small_t_mma_kernel<Geometry, Capacity, Schedule, Fp8GdnInputOutput, true>
+    const Fp8GdnInputOutput<Geometry> output{static_cast<__nv_bfloat16*>(qkv.data),
+                                             static_cast<__nv_bfloat16*>(z.data)};
+    fp8_a16_small_t_mma_kernel<Geometry, Capacity, Schedule, Fp8GdnInputOutput<Geometry>, true>
         <<<Geometry::kOutputRows / Schedule::kRowsPerCta, Schedule::kThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const std::uint8_t*>(weight.qdata),
@@ -46,13 +46,13 @@ void launch_small_mma(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor
 
 template <class Schedule>
 void launch_gemm(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z, cudaStream_t stream) {
-    static_assert(Fp8GdnInputOutput::kQkvRows % Schedule::kBlockRows == 0);
-    static_assert(Fp8GdnInputOutput::kZRows % Schedule::kBlockRows == 0);
+    static_assert(Fp8GdnInputOutput<Geometry>::kQkvRows % Schedule::kBlockRows == 0);
+    static_assert(Fp8GdnInputOutput<Geometry>::kZRows % Schedule::kBlockRows == 0);
     static_assert(Schedule::kSharedBytes <= 48 * 1024);
     const dim3 grid(Geometry::kOutputRows / Schedule::kBlockRows,
                     (x.ne[1] + Schedule::kBlockTokens - 1) / Schedule::kBlockTokens);
-    const Fp8GdnInputOutput output{static_cast<__nv_bfloat16*>(qkv.data),
-                                  static_cast<__nv_bfloat16*>(z.data)};
+    const Fp8GdnInputOutput<Geometry> output{static_cast<__nv_bfloat16*>(qkv.data),
+                                             static_cast<__nv_bfloat16*>(z.data)};
     fp8_a16_gemm_mma_kernel<Geometry, Schedule, false>
         <<<grid, Schedule::kThreads, Schedule::kSharedBytes, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data),

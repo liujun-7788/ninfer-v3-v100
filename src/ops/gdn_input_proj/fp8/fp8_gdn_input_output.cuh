@@ -8,13 +8,12 @@
 
 namespace ninfer::ops::detail {
 
+// Fused row order q|k|v|z with qkv taking 5/8 of the parent rows and z 3/8; holds for the full
+// projection (16384 = 10240|6144) and the TP2 head-split shard (8192 = 5120|3072) alike.
+template <class GeometryT>
 struct Fp8GdnInputOutput {
-    static constexpr std::int32_t kQueryRows = 2048;
-    static constexpr std::int32_t kKeyRows   = 2048;
-    static constexpr std::int32_t kValueRows = 6144;
-    static constexpr std::int32_t kQkvRows   = kQueryRows + kKeyRows + kValueRows;
-    static constexpr std::int32_t kZRows     = 6144;
-    static constexpr std::int32_t kRows      = kQkvRows + kZRows;
+    static constexpr std::int32_t kQkvRows = GeometryT::kOutputRows * 5 / 8;
+    static constexpr std::int32_t kZRows   = GeometryT::kOutputRows * 3 / 8;
 
     __nv_bfloat16* qkv;
     __nv_bfloat16* z;
@@ -37,9 +36,5 @@ struct Fp8GdnInputOutput {
         store_vec(destination(parent_row, token), values);
     }
 };
-
-static_assert(Fp8GdnInputOutput::kRows == 16384);
-static_assert((Fp8GdnInputOutput::kQkvRows % 128) == 0);
-static_assert((Fp8GdnInputOutput::kZRows % 128) == 0);
 
 } // namespace ninfer::ops::detail

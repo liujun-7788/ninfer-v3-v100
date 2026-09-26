@@ -86,7 +86,8 @@ static_assert(catalog_is_closed(k27Routes, kAnyCols));
 static_assert(catalog_is_closed(k35Routes, kAnyCols));
 
 bool is_27(const Bf16GdnGatingProblem& problem) noexcept {
-    return problem.heads == 48 && problem.input_rows == 5120;
+    // 24 heads = the TP2 head-split shard of the 48-head 27B geometry.
+    return problem.input_rows == 5120 && (problem.heads == 48 || problem.heads == 24);
 }
 
 bool is_35(const Bf16GdnGatingProblem& problem) noexcept {

@@ -41,24 +41,32 @@ struct ModelConfig {
     static constexpr int intermediate        = TextConfig::intermediate;
     static constexpr int vocab               = TextConfig::output_rows;
     static constexpr int token_domain        = TextConfig::token_domain;
-    static constexpr int gdn_k_heads         = TextConfig::gdn_key_heads;
     static constexpr int gdn_k_dim           = TextConfig::gdn_key_head_dim;
-    static constexpr int gdn_v_heads         = TextConfig::gdn_value_heads;
     static constexpr int gdn_v_dim           = TextConfig::gdn_value_head_dim;
     // TP2 heads mode: runtime values so the schedule runs with per-rank head halves
-    // (12 q heads / 2 kv heads). All kCfg.n_q/n_kv consumers are runtime tensor views.
+    // (12 q heads / 2 kv heads; GDN 8 key / 24 value heads). All kCfg consumers are
+    // runtime tensor views.
     const int n_q;
     const int n_kv;
     const int q_size;
     const int kv_size;
-    explicit ModelConfig(int q_heads, int kv_heads)
-        : n_q(q_heads), n_kv(kv_heads), q_size(q_heads * TextConfig::head_dim),
-          kv_size(kv_heads * TextConfig::head_dim) {}
+    const int gdn_k_heads;
+    const int gdn_v_heads;
+    const int key_dim;
+    const int value_dim;
+    const int conv_dim;
+    explicit ModelConfig(int heads_div, int gdn_heads_div)
+        : n_q(TextConfig::query_heads / heads_div),
+          n_kv(TextConfig::kv_heads / heads_div),
+          q_size(n_q * TextConfig::head_dim),
+          kv_size(n_kv * TextConfig::head_dim),
+          gdn_k_heads(TextConfig::gdn_key_heads / gdn_heads_div),
+          gdn_v_heads(TextConfig::gdn_value_heads / gdn_heads_div),
+          key_dim(gdn_k_heads * TextConfig::gdn_key_head_dim),
+          value_dim(gdn_v_heads * TextConfig::gdn_value_head_dim),
+          conv_dim(key_dim * 2 + value_dim) {}
     static constexpr int head_dim            = TextConfig::head_dim;
     static constexpr int rotary_dim          = TextConfig::rotary_dim;
-    static constexpr int key_dim             = TextConfig::key_dim;
-    static constexpr int value_dim           = TextConfig::value_dim;
-    static constexpr int conv_dim            = TextConfig::convolution_dim;
     static constexpr int mtp_fc_in           = TextConfig::mtp_input_rows;
     static constexpr int mtp_attn_in         = TextConfig::mtp_attention_input_rows;
     static constexpr int mtp_mlp_gateup_rows = TextConfig::mtp_mlp_gate_up_rows;
@@ -88,8 +96,13 @@ inline int tp2_heads_div() {
                ? 2
                : 1;
 }
-inline const ModelConfig kCfg{TextConfig::query_heads / tp2_heads_div(),
-                              TextConfig::kv_heads / tp2_heads_div()};
+// Bisect switch: NINFER_TP2_GDN=0 keeps the GDN stack fully replicated (full 16/48 heads)
+// while the attention head-split stays active.
+inline int tp2_gdn_div() {
+    const char* e = std::getenv("NINFER_TP2_GDN");
+    return (e != nullptr && std::string_view(e) == "0") ? 1 : tp2_heads_div();
+}
+inline const ModelConfig kCfg{tp2_heads_div(), tp2_gdn_div()};
 inline constexpr float kAttnScale                     = kAttentionScale;
 inline constexpr std::uint32_t kPrefillChunkAlignment = 128;
 

@@ -14,10 +14,9 @@ namespace {
 
 using Launch = void (*)(const Tensor&, const Weight&, Tensor&, Tensor&, cudaStream_t);
 
-template <int ActiveTokens>
+template <class Geometry, int ActiveTokens>
 void launch_exact(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                   cudaStream_t stream) {
-    using Geometry = Nvfp4GdnInputGeometry;
     using Schedule = typename Nvfp4LinearSmallTProductionSchedule<Geometry, ActiveTokens>::Type;
     constexpr int kTokenTiles = (ActiveTokens + Schedule::kTokenTile - 1) / Schedule::kTokenTile;
     constexpr int kBlocks     = (Geometry::kOutputRows / Schedule::kRowsPerCta) * kTokenTiles;
@@ -27,25 +26,34 @@ void launch_exact(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const std::uint8_t*>(weight.qdata),
             static_cast<const std::uint8_t*>(weight.scales), inverse, Nvfp4IdentityEpilogue{},
-            Nvfp4GdnInputOutput{static_cast<__nv_bfloat16*>(qkv.data),
-                                static_cast<__nv_bfloat16*>(z.data)});
+            Nvfp4GdnInputOutput<Geometry>{static_cast<__nv_bfloat16*>(qkv.data),
+                                          static_cast<__nv_bfloat16*>(z.data)});
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <std::size_t... Offsets>
+template <class Geometry, std::size_t... Offsets>
 constexpr auto make_launchers(std::index_sequence<Offsets...>) {
     return std::array<Launch, sizeof...(Offsets)>{
-        &launch_exact<kNvfp4FirstSmallT + static_cast<int>(Offsets)>...};
+        &launch_exact<Geometry, kNvfp4FirstSmallT + static_cast<int>(Offsets)>...};
 }
 
-constexpr auto kLaunchers =
-    make_launchers(std::make_index_sequence<kNvfp4LastSmallT - kNvfp4FirstSmallT + 1>{});
+template <class Geometry>
+struct LauncherTable {
+    static constexpr auto kTable =
+        make_launchers<Geometry>(std::make_index_sequence<kNvfp4LastSmallT - kNvfp4FirstSmallT + 1>{});
+};
 
 } // namespace
 
 void nvfp4_gdn_input_small_t_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                     cudaStream_t stream) {
-    kLaunchers[x.ne[1] - kNvfp4FirstSmallT](x, weight, qkv, z, stream);
+    if (weight.n == Nvfp4GdnInputShardGeometry::kOutputRows) {
+        constexpr auto& table = LauncherTable<Nvfp4GdnInputShardGeometry>::kTable;
+        table[x.ne[1] - kNvfp4FirstSmallT](x, weight, qkv, z, stream);
+        return;
+    }
+    constexpr auto& table = LauncherTable<Nvfp4GdnInputGeometry>::kTable;
+    table[x.ne[1] - kNvfp4FirstSmallT](x, weight, qkv, z, stream);
 }
 
 } // namespace ninfer::ops::detail

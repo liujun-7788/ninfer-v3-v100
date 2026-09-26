@@ -136,7 +136,7 @@ void launch_nvfp4_w4a4_tma_gdn(const std::uint8_t* activation_codes,
                                float alpha, cudaStream_t stream) {
     launch_tma<Nvfp4GdnInputGeometry, TmaM256N128>(
         activation_codes, activation_scales, weight_codes, weight_scales, tokens, alpha,
-        Nvfp4IdentityEpilogue{}, Nvfp4GdnInputOutput{qkv, z}, stream);
+        Nvfp4IdentityEpilogue{}, Nvfp4GdnInputOutput<Nvfp4GdnInputGeometry>{qkv, z}, stream);
 }
 
 template <class Geometry>

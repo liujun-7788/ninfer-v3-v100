@@ -46,15 +46,16 @@ void nvfp4_gdn_record_small_t_launch(const Tensor& x, const Weight& weight,
                                      Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
                                      Tensor& z, cudaStream_t stream);
 
-void nvfp4_gdn_snapshot_post_launch(const Tensor& projected, const Tensor& conv_weight,
-                                    Tensor& conv_states, const Tensor& valid_columns,
-                                    const Tensor& initial_slot, const Tensor& snapshot_base_slot,
-                                    Tensor& query, Tensor& key, Tensor& value, cudaStream_t stream);
+void nvfp4_gdn_snapshot_post_launch(const Tensor& projected, const Weight& weight,
+                                    const Tensor& conv_weight, Tensor& conv_states,
+                                    const Tensor& valid_columns, const Tensor& initial_slot,
+                                    const Tensor& snapshot_base_slot, Tensor& query, Tensor& key,
+                                    Tensor& value, cudaStream_t stream);
 
-void nvfp4_gdn_record_post_launch(const Tensor& conv_record, const Tensor& conv_weight,
-                                  const Tensor& conv_states, const Tensor& valid_columns,
-                                  const Tensor& initial_slot, Tensor& query, Tensor& key,
-                                  Tensor& value, cudaStream_t stream);
+void nvfp4_gdn_record_post_launch(const Tensor& conv_record, const Weight& weight,
+                                  const Tensor& conv_weight, const Tensor& conv_states,
+                                  const Tensor& valid_columns, const Tensor& initial_slot,
+                                  Tensor& query, Tensor& key, Tensor& value, cudaStream_t stream);
 
 void nvfp4_gdn_snapshot_dispatch(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
                                  Tensor& conv_states, const Tensor& valid_columns,

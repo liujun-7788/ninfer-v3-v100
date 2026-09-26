@@ -190,6 +190,13 @@ void launch_recurrent_record(const Tensor& q, const Tensor& k, const Tensor& v, 
 void launch_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,
                         const GdnReplayFoldKernelRows& rows, std::int32_t active_rows,
                         cudaStream_t stream) {
+    if (records.spec.layers == FoldGeometry48x24::kLayers &&
+        records.spec.qk_heads == FoldGeometry48x24::kQkHeads &&
+        records.spec.value_heads == FoldGeometry48x24::kValueHeads &&
+        records.spec.conv_channels == FoldGeometry48x24::kConvChannels) {
+        launch_replay_fold_fixed<FoldGeometry48x24>(records, states, rows, active_rows, stream);
+        return;
+    }
     if (records.spec.layers == FoldGeometry48x48::kLayers &&
         records.spec.qk_heads == FoldGeometry48x48::kQkHeads &&
         records.spec.value_heads == FoldGeometry48x48::kValueHeads &&

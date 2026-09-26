@@ -132,9 +132,11 @@ void prepack_sharded(Weight& w, bool nvfp4_mlp) {
 // Compacts the first `rows` dimension of a weight to n_new per the segment table, in place.
 // Code copies run first (ascending destination, each segment destination ends before the next
 // segment source begins), then the scale plane moves in a second phase, so later code sources
-// are never clobbered and scale destinations never reach the old scale plane.
+// are never clobbered and scale destinations never reach the old scale plane. Segment tables
+// whose destination and source ranges interleave must pass a full-payload `snapshot` buffer:
+// sources are then read from the pristine copy while destinations are written in place.
 void shard_rows(Weight& w, int rank, std::span<const Segment> segs, std::int32_t n_new,
-                const char* what) {
+                const char* what, const void* snapshot = nullptr) {
     require_shardable(w, what);
     static std::atomic<int> spy{0};
     if (spy.fetch_add(1) < 6) {
@@ -146,8 +148,8 @@ void shard_rows(Weight& w, int rank, std::span<const Segment> segs, std::int32_t
     if (w.n != 2 * n_new) {
         throw std::logic_error(std::string(what) + ": unexpected row count for tp2 sharding");
     }
-    const auto* base    = static_cast<const std::byte*>(w.qdata);
-    auto* dst_base      = const_cast<std::byte*>(base);
+    const auto* base = static_cast<const std::byte*>(snapshot != nullptr ? snapshot : w.qdata);
+    auto* dst_base   = reinterpret_cast<std::byte*>(const_cast<void*>(w.qdata));
     const int tail_rank = rank; // kept symmetric with shard_columns for readability
 
     if (w.layout == QuantLayout::RowScale && w.qtype == QType::FP8_E4M3FN_ROW_BF16S) {
@@ -376,6 +378,38 @@ void shard_elementwise_half(Tensor& t, int rank, const char* what) {
     t.ne[3] = 1;
 }
 
+// Compacts the channel extent of the depthwise GDN conv1d weight per the qkv channel segment
+// table. Memory layout is tap-major slabs of `channels` elements (offset = tap * channels +
+// channel), so each tap's channel range is one contiguous slab; `snapshot` (a pristine copy of
+// the tensor payload, e.g. the staging scratch) guards against interleaved ranges.
+void shard_conv1d_channels(Tensor& t, int rank, const std::vector<Segment>& segs,
+                           const void* snapshot, const char* what) {
+    const std::size_t esize = t.numel() ? (t.bytes() / t.numel()) : 0;
+    if (esize == 0 || t.ne[1] != 4 || t.ne[2] != 1 || t.ne[3] != 1) {
+        throw std::logic_error(std::string(what) + ": cannot halve the conv1d tensor");
+    }
+    const std::int32_t channels_old = t.ne[0];
+    const std::int32_t channels_new = channels_old / 2;
+    const auto* src_base            = static_cast<const std::uint8_t*>(snapshot);
+    auto* dst_base                  = static_cast<std::uint8_t*>(t.data);
+    for (const Segment& s : segs) {
+        for (int tap = 0; tap < 4; ++tap) {
+            check_cuda(
+                cudaMemcpy(dst_base + static_cast<std::int64_t>(tap) * channels_new * esize +
+                               static_cast<std::int64_t>(s.dst) * esize,
+                           src_base + static_cast<std::int64_t>(tap) * channels_old * esize +
+                               static_cast<std::int64_t>(s.src) * esize,
+                           static_cast<std::uint64_t>(s.count) * esize, cudaMemcpyDeviceToDevice),
+                   "conv1d segment copy");
+        }
+    }
+    t.ne[0] = channels_new;
+    t.nb[0] = static_cast<std::int64_t>(esize);
+    t.nb[1] = static_cast<std::int64_t>(channels_new) * static_cast<std::int64_t>(esize);
+    t.nb[2] = t.nb[1] * t.ne[1];
+    t.nb[3] = t.nb[2] * t.ne[2];
+}
+
 void tp_shard_model(RuntimeModelView& runtime, int rank) {
     if (rank != 0 && rank != 1) {
         throw std::invalid_argument("tp2 shard rank must be 0 or 1");
@@ -594,6 +628,79 @@ void tp_shard_model(RuntimeModelView& runtime, int rank) {
                 }
                 prepack_sharded(layer.post_mixer.down, false);
             }
+        }
+    }
+
+    const char* gdn_env = std::getenv("NINFER_TP2_GDN");
+    const bool shard_gdn =
+        shard_heads && shard_mlp && (gdn_env == nullptr || std::string_view(gdn_env) != "0");
+    if (shard_gdn) {
+        // GDN head-split (heads_mlp only): the fused qkvz input projection keeps the r-th half
+        // of every head segment -> 8192 rows. Row order per the GDN conv epilogue:
+        // q[0:2048] | k[2048:4096] | v[4096:10240] | z[10240:16384]; rank r keeps q/k rows
+        // [r*1024,+1024) and v/z rows [base + r*3072,+3072), all 128-row aligned. The conv1d
+        // weight is channel-major ({width=4} fast dim), decay vectors hold one entry per value
+        // head, and the control projections hold one row per value head.
+        for (GdnWeights& layer : runtime.gdn_layers) {
+            Weight& qkvz =
+                std::get<FusedGdnInputProjectionPayload>(layer.projection.input_projection)
+                    .query_key_value_z;
+            const std::int64_t qk_off = rank * 1024;
+            const std::int64_t v_off  = rank * 3072;
+            const std::vector<Segment> qkvz_segs = {
+                Segment{static_cast<std::int32_t>(qk_off), 1024, 0},
+                Segment{static_cast<std::int32_t>(2048 + qk_off), 1024, 1024},
+                Segment{static_cast<std::int32_t>(4096 + v_off), 3072, 2048},
+                Segment{static_cast<std::int32_t>(10240 + v_off), 3072, 5120},
+            };
+            // The q|k|v|z segment table interleaves source and destination ranges, so the
+            // compaction reads from a pristine payload snapshot instead of the in-place buffer.
+            void* qkvz_snapshot = nullptr;
+            check_cuda(cudaMalloc(&qkvz_snapshot, qkvz.payload_bytes), "gdn qkvz snapshot");
+            check_cuda(cudaMemcpy(qkvz_snapshot, qkvz.qdata, qkvz.payload_bytes,
+                                  cudaMemcpyDeviceToDevice),
+                       "gdn qkvz snapshot copy");
+            shard_rows(qkvz, rank, qkvz_segs, 8192, "gdn qkvz head-split", qkvz_snapshot);
+            check_cuda(cudaFree(qkvz_snapshot), "gdn qkvz snapshot free");
+            // The conv1d weight shares the qkv channel segmentation (no z rows). The 2 MiB
+            // staging scratch holds a pristine snapshot (full tensor is only 80 KiB).
+            const std::vector<Segment> conv_segs = {
+                Segment{static_cast<std::int32_t>(qk_off), 1024, 0},
+                Segment{static_cast<std::int32_t>(2048 + qk_off), 1024, 1024},
+                Segment{static_cast<std::int32_t>(4096 + v_off), 3072, 2048},
+            };
+            check_cuda(cudaMemcpy(scratch, layer.convolution.data,
+                                  layer.convolution.numel() * sizeof(std::uint16_t),
+                                  cudaMemcpyDeviceToDevice),
+                       "conv1d snapshot copy");
+            shard_conv1d_channels(layer.convolution, rank, conv_segs, scratch, "gdn conv1d");
+            shard_elementwise_half(layer.projection.a_log, rank, "gdn a_log");
+            shard_elementwise_half(layer.projection.dt_bias, rank, "gdn dt_bias");
+            auto* split_control =
+                std::get_if<SplitGdnControlProjectionPayload>(&layer.projection.control_projection);
+            const std::vector<Segment> control_segs = {
+                Segment{static_cast<std::int32_t>(rank * 24), 24, 0},
+            };
+            if (split_control != nullptr) {
+                shard_rows(split_control->a_projection, rank, control_segs, 24, "gdn control a");
+                shard_rows(split_control->b_projection, rank, control_segs, 24, "gdn control b");
+            } else {
+                // Fused control (nvfp4 profiles): a rows [0:48) stacked on b rows [48:96); each
+                // rank keeps its 24 rows from both halves.
+                auto* fused_control = std::get_if<FusedGdnControlProjectionPayload>(
+                    &layer.projection.control_projection);
+                if (fused_control == nullptr) {
+                    throw std::logic_error("gdn head-split: unknown control projection payload");
+                }
+                const std::vector<Segment> fused_control_segs = {
+                    Segment{static_cast<std::int32_t>(rank * 24), 24, 0},
+                    Segment{static_cast<std::int32_t>(48 + rank * 24), 24, 24},
+                };
+                shard_rows(fused_control->a_b_projection, rank, fused_control_segs, 48,
+                           "gdn control ab");
+            }
+            shard_columns(layer.output, rank, 3072, scratch, kStagingBytes, "gdn output");
+            prepack_sharded(layer.output, false);
         }
     }
 

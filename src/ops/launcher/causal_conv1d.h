@@ -15,6 +15,7 @@ namespace ninfer::ops::detail {
 enum class CausalConvSplitGeometry {
     Rows2048x2048x4096,
     Rows2048x2048x6144,
+    Rows1024x1024x3072,
 };
 
 inline constexpr std::int32_t kCausalConvParallelMaxTokens = 32;

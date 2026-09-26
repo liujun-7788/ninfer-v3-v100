@@ -98,8 +98,8 @@ template <class Config, class Allocator>
 GdnControlRoots gdn_control(Allocator& allocator, std::int32_t tokens) {
     return {
         matrix(allocator, DType::BF16, Config::hidden, tokens),
-        matrix(allocator, DType::FP32, Config::gdn_value_heads, tokens),
-        matrix(allocator, DType::FP32, Config::gdn_value_heads, tokens),
+        matrix(allocator, DType::FP32, schedule::kCfg.gdn_v_heads, tokens),
+        matrix(allocator, DType::FP32, schedule::kCfg.gdn_v_heads, tokens),
     };
 }
 
@@ -113,26 +113,26 @@ struct GdnProjectionRoots {
 template <class Config, class Allocator>
 GdnProjectionRoots gdn_projection(Allocator& allocator, std::int32_t tokens) {
     return {
-        matrix(allocator, DType::BF16, Config::value_dim, tokens),
-        matrix(allocator, DType::BF16, Config::key_dim, tokens),
-        matrix(allocator, DType::BF16, Config::key_dim, tokens),
-        matrix(allocator, DType::BF16, Config::value_dim, tokens),
+        matrix(allocator, DType::BF16, schedule::kCfg.value_dim, tokens),
+        matrix(allocator, DType::BF16, schedule::kCfg.key_dim, tokens),
+        matrix(allocator, DType::BF16, schedule::kCfg.key_dim, tokens),
+        matrix(allocator, DType::BF16, schedule::kCfg.value_dim, tokens),
     };
 }
 
 template <class Config, class Allocator>
 Tensor gdn_prefill_conv(Allocator& allocator, std::int32_t tokens) {
-    return matrix(allocator, DType::BF16, Config::convolution_dim, tokens);
+    return matrix(allocator, DType::BF16, schedule::kCfg.conv_dim, tokens);
 }
 
 template <class Config, class Allocator>
 Tensor gdn_recurrent_output(Allocator& allocator, std::int32_t tokens) {
-    return matrix(allocator, DType::BF16, Config::value_dim, tokens);
+    return matrix(allocator, DType::BF16, schedule::kCfg.value_dim, tokens);
 }
 
 template <class Config, class Allocator>
 Tensor gdn_normalized_output(Allocator& allocator, std::int32_t tokens) {
-    return matrix(allocator, DType::BF16, Config::value_dim, tokens);
+    return matrix(allocator, DType::BF16, schedule::kCfg.value_dim, tokens);
 }
 
 template <class Config, class Allocator>

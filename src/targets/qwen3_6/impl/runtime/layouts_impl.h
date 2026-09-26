@@ -133,9 +133,9 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         .linear =
             {
                 .layers         = TextConfig::gdn_layers(),
-                .conv_channels  = TextConfig::convolution_dim,
+                .conv_channels  = schedule::kCfg.conv_dim,
                 .conv_width     = TextConfig::gdn_conv_state_width,
-                .value_heads    = TextConfig::gdn_value_heads,
+                .value_heads    = schedule::kCfg.gdn_v_heads,
                 .value_head_dim = TextConfig::gdn_value_head_dim,
                 .key_head_dim   = TextConfig::gdn_key_head_dim,
                 .slot_count     = state_image_slots,
@@ -160,9 +160,9 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                          .layers          = TextConfig::gdn_layers(),
                          .record_capacity = static_cast<std::int32_t>(plan.max_concurrency),
                          .width           = static_cast<std::int32_t>(plan.draft_window + 1U),
-                         .conv_channels   = TextConfig::convolution_dim,
-                         .qk_heads        = TextConfig::gdn_key_heads,
-                         .value_heads     = TextConfig::gdn_value_heads,
+                         .conv_channels   = schedule::kCfg.conv_dim,
+                         .qk_heads        = schedule::kCfg.gdn_k_heads,
+                         .value_heads     = schedule::kCfg.gdn_v_heads,
                          .key_dim         = TextConfig::gdn_key_head_dim,
                          .value_dim       = TextConfig::gdn_value_head_dim,
                      });
@@ -172,9 +172,9 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                              .layers          = TextConfig::gdn_layers(),
                              .record_capacity = static_cast<std::int32_t>(plan.max_concurrency),
                              .width = static_cast<std::int32_t>(qwen3_6::kMtpLookupMaximumWidth),
-                             .conv_channels = TextConfig::convolution_dim,
-                             .qk_heads      = TextConfig::gdn_key_heads,
-                             .value_heads   = TextConfig::gdn_value_heads,
+                             .conv_channels = schedule::kCfg.conv_dim,
+                             .qk_heads      = schedule::kCfg.gdn_k_heads,
+                             .value_heads   = schedule::kCfg.gdn_v_heads,
                              .key_dim       = TextConfig::gdn_key_head_dim,
                              .value_dim     = TextConfig::gdn_value_head_dim,
                          });
@@ -322,7 +322,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         if (path == GdnWorkspacePath::Prefill) {
             scratch(layout,
                     ops::gated_delta_net_workspace_capacity_bytes(
-                        TextConfig::gdn_key_heads, TextConfig::gdn_value_heads, true, first, last));
+                        schedule::kCfg.gdn_k_heads, schedule::kCfg.gdn_v_heads, true, first, last));
         }
         (void)workspace_recipe::gdn_normalized_output<TextConfig>(layout, last);
         scratch(layout, Variant::gdn_output_projection_workspace_capacity_bytes(

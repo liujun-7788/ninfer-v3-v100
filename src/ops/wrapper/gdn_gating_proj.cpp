@@ -48,9 +48,14 @@ struct GdnControlParentGeometry {
 };
 
 GdnControlParentGeometry require_bf16_parent(const Weight& parent) {
+    // n = 2 * heads (a rows stacked on b rows); 48 = the TP2 head-split shard of 96.
     if (parent.n == 96 && parent.k == 5120) {
         require_bf16_weight(parent, 96, 5120, "ab_weight");
         return {.input_rows = 5120, .heads = 48};
+    }
+    if (parent.n == 48 && parent.k == 5120) {
+        require_bf16_weight(parent, 48, 5120, "ab_weight");
+        return {.input_rows = 5120, .heads = 24};
     }
     if (parent.n == 64 && parent.k == 2048) {
         require_bf16_weight(parent, 64, 2048, "ab_weight");
@@ -140,18 +145,21 @@ void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
                           Tensor& beta, DeviceExecutionView execution) {
     constexpr const char* op  = "gdn_norm_gating_proj";
     const std::int32_t tokens = x.ne[1];
+    // One gate entry per value head; the TP2 head-split shard halves A_log (and everything
+    // derived from it), so the head count comes from the tensor rather than a constant.
+    const std::int32_t heads  = A_log.ne[0];
     if (!(eps > 0.0F) || !std::isfinite(eps)) {
         throw std::invalid_argument("gdn_norm_gating_proj: eps must be positive and finite");
     }
     require_sequence_tensor(x, DType::BF16, 5120, tokens, op, "x");
     require_vector_tensor(norm_weight, DType::BF16, 5120, op, "norm_weight");
     require_sequence_tensor(h, DType::BF16, 5120, tokens, op, "h");
-    require_vector_tensor(A_log, DType::FP32, 48, op, "A_log");
-    require_vector_tensor(dt_bias, DType::FP32, 48, op, "dt_bias");
-    require_sequence_tensor(g, DType::FP32, 48, tokens, op, "g");
-    require_sequence_tensor(beta, DType::FP32, 48, tokens, op, "beta");
-    require_bf16_weight(a_weight, 48, 5120, "a_weight");
-    require_bf16_weight(b_weight, 48, 5120, "b_weight");
+    require_vector_tensor(A_log, DType::FP32, heads, op, "A_log");
+    require_vector_tensor(dt_bias, DType::FP32, heads, op, "dt_bias");
+    require_sequence_tensor(g, DType::FP32, heads, tokens, op, "g");
+    require_sequence_tensor(beta, DType::FP32, heads, tokens, op, "beta");
+    require_bf16_weight(a_weight, heads, 5120, "a_weight");
+    require_bf16_weight(b_weight, heads, 5120, "b_weight");
     require_execution(execution, op);
 
     detail::bf16_gdn_norm_gating_dispatch(x, norm_weight, eps, h, a_weight, b_weight, A_log,

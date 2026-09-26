@@ -55,8 +55,10 @@ std::size_t fp8_gdn_input_workspace_capacity_bytes(LinearPolicy policy, std::int
 
 void fp8_gdn_input_a16_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                 WorkspaceArena* workspace, cudaStream_t stream) {
-    constexpr std::int32_t kQkvRows = 10240;
-    constexpr std::int32_t kZRows   = 6144;
+    // Fused row order q|k|v|z: qkv takes 5/8 of the parent rows and z 3/8, for both the full
+    // projection (16384) and the head-split shard (8192).
+    const std::int32_t kQkvRows = weight.n * 5 / 8;
+    const std::int32_t kZRows   = weight.n * 3 / 8;
 #ifdef NINFER_VOLTA_BUILD
     if (x.ne[1] >= kVoltaCutlassMinT) {
         if (workspace == nullptr) {

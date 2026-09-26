@@ -92,8 +92,9 @@ void nvfp4_gdn_snapshot_dispatch(const Tensor& x, const Weight& weight, const Te
     WorkspaceArena projection_workspace(scratch.projection);
     nvfp4_gdn_input_dispatch(x, weight, scratch.projected, z, kNvfp4InternalPolicy,
                              &projection_workspace, stream);
-    nvfp4_gdn_snapshot_post_launch(scratch.projected, conv_weight, conv_states, valid_columns,
-                                   initial_slot, snapshot_base_slot, query, key, value, stream);
+    nvfp4_gdn_snapshot_post_launch(scratch.projected, weight, conv_weight, conv_states,
+                                   valid_columns, initial_slot, snapshot_base_slot, query, key,
+                                   value, stream);
 }
 
 } // namespace ninfer::ops::detail

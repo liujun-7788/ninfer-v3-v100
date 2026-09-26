@@ -23,9 +23,11 @@ Nvfp4GdnInputRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
 
 void launch_a16(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                 cudaStream_t stream) {
-    constexpr std::int32_t kChunk   = kNvfp4LastSmallT;
-    constexpr std::int32_t kQkvRows = 10240;
-    constexpr std::int32_t kZRows   = 6144;
+    constexpr std::int32_t kChunk = kNvfp4LastSmallT;
+    // Fused row order q|k|v|z: qkv takes 5/8 of the parent rows and z 3/8, for both the full
+    // projection (16384) and the head-split shard (8192).
+    const std::int32_t kQkvRows = weight.n * 5 / 8;
+    const std::int32_t kZRows   = weight.n * 3 / 8;
     for (std::int32_t token_begin = 0; token_begin < x.ne[1]; token_begin += kChunk) {
         const std::int32_t active = std::min(kChunk, x.ne[1] - token_begin);
         auto* input               = static_cast<std::uint8_t*>(x.data) +

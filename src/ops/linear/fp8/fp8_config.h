@@ -431,6 +431,20 @@ struct Fp8LinearSmallTProductionSchedule<Fp8GdnInputGeometry, ActiveTokens> {
                           Fp8CodeCache::Default, 1, Fp8SmallTBlockOrder::RowsContiguous, 1>;
 };
 
+// TP2 shard geometry inherits the fused GDN problem's schedule.
+template <int ActiveTokens>
+struct Fp8LinearSmallTProductionSchedule<Fp8GdnInputShardGeometry, ActiveTokens> {
+    static_assert(ActiveTokens >= kFp8FirstSmallT);
+    static_assert(ActiveTokens <= kFp8LinearSmallTMax<Fp8GdnInputShardGeometry>);
+    static constexpr int kValuesPerLane     = ActiveTokens >= 5 && ActiveTokens <= 6 ? 8 : 16;
+    static constexpr auto kActivationAccess = ActiveTokens <= 4
+                                                  ? Fp8SmallTActivationAccess::SharedPhase
+                                                  : Fp8SmallTActivationAccess::TokenPacked;
+    using Type =
+        Fp8SmallTSchedule<8, 2, kValuesPerLane, ActiveTokens, 1, kActivationAccess,
+                          Fp8CodeCache::Default, 1, Fp8SmallTBlockOrder::RowsContiguous, 1>;
+};
+
 template <int ActiveTokens>
 struct Fp8LinearSmallTProductionSchedule<Fp8MlpGateUpGeometry, ActiveTokens> {
     static_assert(ActiveTokens >= kFp8FirstSmallT);
