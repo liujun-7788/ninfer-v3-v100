@@ -237,11 +237,18 @@ public:
                (!have_decode || previous_unit_was_decode);
     }
 
+    // Decode-burst scheduling: while a prefill lane is active, run up to decode_burst_max
+    // consecutive decode rounds before resuming prefill chunks. The default of 1 reproduces
+    // the strict prefill/decode alternation; larger values trade TTFT for decode ITL (each
+    // prefill chunk monopolizes the engine for its whole duration, so burst length bounds the
+    // decode gap between chunks). decode_burst counts decode/control units since the last
+    // prefill unit; prefill resets it.
     [[nodiscard]] ExecutionAction choose_execution(bool have_decode, bool prefill_runnable,
-                                                   bool previous_unit_was_decode) const noexcept {
+                                                   std::uint32_t decode_burst,
+                                                   std::uint32_t decode_burst_max) const noexcept {
         if (prefill_runnable) {
-            return have_decode && !previous_unit_was_decode ? ExecutionAction::Decode
-                                                            : ExecutionAction::Prefill;
+            return have_decode && decode_burst < decode_burst_max ? ExecutionAction::Decode
+                                                                  : ExecutionAction::Prefill;
         }
         return have_decode ? ExecutionAction::Decode : ExecutionAction::Wait;
     }

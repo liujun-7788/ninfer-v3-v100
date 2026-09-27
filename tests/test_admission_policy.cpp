@@ -178,13 +178,15 @@ int main() {
                           !scheduler.should_attempt_admission(true, true, true, false, false) &&
                           scheduler.should_attempt_admission(true, true, true, true, false) &&
                           !scheduler.should_attempt_admission(true, true, false, false, true) &&
-                          scheduler.choose_execution(true, false, false) == ExecutionAction::Decode,
+                          scheduler.choose_execution(true, false, 0, 1) == ExecutionAction::Decode,
                       "admission and GPU-unit fairness gates changed");
     scheduler.set_prefill_lane(0);
     failures +=
         check(!scheduler.should_attempt_admission(true, true, true, true, false) &&
-                  scheduler.choose_execution(true, true, false) == ExecutionAction::Decode &&
-                  scheduler.choose_execution(true, true, true) == ExecutionAction::Prefill,
+                  scheduler.choose_execution(true, true, 0, 1) == ExecutionAction::Decode &&
+                  scheduler.choose_execution(true, true, 1, 1) == ExecutionAction::Prefill &&
+                  scheduler.choose_execution(true, true, 7, 8) == ExecutionAction::Decode &&
+                  scheduler.choose_execution(true, true, 8, 8) == ExecutionAction::Prefill,
               "prefill/decode alternation changed");
     scheduler.clear_prefill_lane(0);
 

@@ -1924,6 +1924,14 @@ private:
 
     void worker_loop() noexcept {
         bool previous_unit_was_decode = false;
+        // Decode-burst knob: consecutive decode/control units allowed between prefill chunks
+        // while a prefill lane is active. 1 reproduces the strict alternation.
+        const std::uint32_t decode_burst_max = [] {
+            const char* e = std::getenv("NINFER_DECODE_BURST");
+            const int parsed = e == nullptr ? 1 : std::atoi(e);
+            return parsed < 1 ? 1u : static_cast<std::uint32_t>(parsed);
+        }();
+        std::uint32_t decode_burst = 0;
         for (;;) {
             {
                 std::unique_lock lock(queue_mutex_);
@@ -1979,6 +1987,7 @@ private:
                     finish_engine_phase(boundary, EngineHostPhase::Boundary);
                     run_control_batch(control_membership);
                     previous_unit_was_decode = true;
+                    ++decode_burst;
                     continue;
                 }
                 membership = scheduler_.build_round_membership(slots_, max_concurrency_);
@@ -1990,13 +1999,15 @@ private:
                     }
                     prefill_runnable = !slots_[*lane]->capture_pending;
                 }
-                const ExecutionAction action = scheduler_.choose_execution(
-                    !membership.empty(), prefill_runnable, previous_unit_was_decode);
+                const ExecutionAction action =
+                    scheduler_.choose_execution(!membership.empty(), prefill_runnable, decode_burst,
+                                                decode_burst_max);
                 if (action == ExecutionAction::Prefill) {
                     set_host_work_class(HostWorkClass::Prefill);
                     finish_engine_phase(boundary, EngineHostPhase::Boundary);
                     run_prefill_step(cancelled_at_unit_start);
                     previous_unit_was_decode = false;
+                    decode_burst = 0;
                     continue;
                 }
                 if (action == ExecutionAction::Decode) {
@@ -2004,6 +2015,7 @@ private:
                     finish_engine_phase(boundary, EngineHostPhase::Boundary);
                     run_decode_round(membership, cancelled_at_unit_start);
                     previous_unit_was_decode = true;
+                    ++decode_burst;
                     continue;
                 }
                 set_host_work_class(HostWorkClass::Control);
