@@ -425,7 +425,12 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__
             for (int sub = 0; sub < PVChunks; ++sub) {
                 const int sub_k0 = k0 + sub * 8;
 
-                // --- QK^T: accumulate over the full D=256 head dim, 8 real k-elements/call. ---
+                // --- QK^T: accumulate over the full D=256 head dim, 8 real k-elements/call.
+                // NOTE (measured): this is a 64-deep dependent HMMA chain per sub, but splitting
+                // it into 4 independent accumulator chains changed NOTHING at 65k (0.99 ->
+                // 1.00 ms/layer) while adding 32 registers to an already 218-reg kernel -- the
+                // bottleneck is warp-level latency hiding (2 CTAs/SM = 8 warps/SM at 218
+                // regs), not chain depth. The real fix is a register diet + 8-warp D-split. ---
                 float d_score[8] = {0, 0, 0, 0, 0, 0, 0, 0};
 #pragma unroll
                 for (int c = 0; c < DChunks; ++c) {

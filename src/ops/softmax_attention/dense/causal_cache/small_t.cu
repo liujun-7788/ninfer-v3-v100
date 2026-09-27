@@ -16,6 +16,8 @@
 
 #include <cstdint>
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -334,6 +336,26 @@ void causal_attention_small_t_launch_for(const Tensor& q, CacheInput input, cons
     const auto splits                = causal_attention_split_capacity(
         Geometry::QHeads, invocation.width, cache.storage, envelope, invocation.batch_size);
 
+    // NINFER_ATTN_PROF: per-call device timing of the partial+reduce pair, for eager paths
+    // only (graph capture skips the probe entirely). Reporting is deferred by one call and
+    // never synchronizes the host -- a blocking read here would stall this rank's host
+    // thread against the peer rank's allreduce handshake (the TP2PROF lesson).
+    static const bool prof_attn = std::getenv("NINFER_ATTN_PROF") != nullptr;
+    static std::int64_t prof_counter = 0;
+    static cudaEvent_t prof_start = nullptr, prof_end = nullptr;
+    static int prof_prev_window = 0, prof_prev_splits = 0, prof_prev_tokens = 0;
+    cudaStreamCaptureStatus prof_capture = cudaStreamCaptureStatusNone;
+    cudaStreamIsCapturing(stream, &prof_capture);
+    const bool prof_this =
+        prof_attn && ++prof_counter % 16 == 0 &&
+        prof_capture == cudaStreamCaptureStatusNone && invocation.batch_size == 1;
+    cudaEvent_t prof_ev_start = nullptr, prof_ev_end = nullptr;
+    if (prof_this) {
+        cudaEventCreate(&prof_ev_start);
+        cudaEventCreate(&prof_ev_end);
+        cudaEventRecord(prof_ev_start, stream);
+    }
+
     // BF16 keeps its row-tile warp count; INT8 selects its producer/consumer
     // geometry inside launch_tc_partial_i8.
 #define NINFER_CAUSAL_SMALL_T_DISPATCH(TOKENS, WARPS)                                              \
@@ -436,6 +458,25 @@ void causal_attention_small_t_launch_for(const Tensor& q, CacheInput input, cons
     else
         launch_for_storage.template operator()<false>();
     CUDA_CHECK(cudaGetLastError());
+
+    if (prof_this) {
+        cudaEventRecord(prof_ev_end, stream);
+        if (prof_start != nullptr) {
+            float ms = 0.0f;
+            if (cudaEventElapsedTime(&ms, prof_start, prof_end) == cudaSuccess) {
+                std::fprintf(stderr,
+                             "ATTNPROF window=%d splits=%d tokens=%d take=%.3f ms\n",
+                             prof_prev_window, prof_prev_splits, prof_prev_tokens, ms);
+            }
+            cudaEventDestroy(prof_start);
+            cudaEventDestroy(prof_end);
+        }
+        prof_start       = prof_ev_start;
+        prof_end         = prof_ev_end;
+        prof_prev_window = implementation_window;
+        prof_prev_splits = splits;
+        prof_prev_tokens = invocation.width;
+    }
 }
 
 void causal_attention_small_t_launch(
