@@ -69,23 +69,30 @@ __global__ __launch_bounds__(Nvfp4VoltaTmmaSchedule::kThreads, 4) void nvfp4_vol
     const int scale_tiles = k / 64; // BlockScaleK16M128x4 tile stride, 4 groups per tile
 
     struct Carry {
-        uint4 xraw;
+        uint4 xraw[2];
         std::uint32_t word;
         std::uint8_t scale_byte;
-        bool xactive;
+        bool xactive[2];
         bool row_good;
     };
     Carry carry;
 
     auto prefetch = [&](int kbase, Carry& r) {
-        // Activations: 128 rows x 4 uint4 vecs = 512 threads, one vec each.
-        const int idx  = static_cast<int>(threadIdx.x);
-        const int xrow = idx / 4;
-        const int v    = idx % 4;
-        r.xactive      = t0 + xrow < t;
-        if (r.xactive) {
-            r.xraw = *reinterpret_cast<const uint4*>(
-                x + static_cast<std::int64_t>(t0 + xrow) * k + kbase + v * 8);
+        // Activations: 128 rows x 4 uint4 vecs = 512 vecs; 256 threads, two vecs each, so the
+        // whole tile is staged every step. (This prefetch originally covered only rows 0-63
+        // of the 128-row tile, leaving output rows 64-127 reading uninitialized shared
+        // memory -- verified standalone before the fix.)
+        const int idx = static_cast<int>(threadIdx.x);
+#pragma unroll
+        for (int u = 0; u < 2; ++u) {
+            const int unit = idx + u * S::kThreads;
+            const int xrow = unit / 4;
+            const int v    = unit % 4;
+            r.xactive[u]   = t0 + xrow < t;
+            if (r.xactive[u]) {
+                r.xraw[u] = *reinterpret_cast<const uint4*>(
+                    x + static_cast<std::int64_t>(t0 + xrow) * k + kbase + v * 8);
+            }
         }
         // Weights: the warp's 8 rows x 4 lane-windows, one uint32 (8 weights) per lane.
         const int r_row = lane >> 2;
@@ -112,13 +119,17 @@ __global__ __launch_bounds__(Nvfp4VoltaTmmaSchedule::kThreads, 4) void nvfp4_vol
 
     auto commit = [&](const Carry& r, int buf) {
         const int idx = static_cast<int>(threadIdx.x);
-        if (r.xactive) {
-            const auto* src = reinterpret_cast<const __nv_bfloat16*>(&r.xraw);
-            __half tmp[8];
 #pragma unroll
-            for (int j = 0; j < 8; ++j) { tmp[j] = __float2half(__bfloat162float(src[j])); }
-            *reinterpret_cast<uint4*>(&x_sh[buf][idx / 4][(idx % 4) * 8]) =
-                *reinterpret_cast<const uint4*>(tmp);
+        for (int u = 0; u < 2; ++u) {
+            if (r.xactive[u]) {
+                const auto* src = reinterpret_cast<const __nv_bfloat16*>(&r.xraw[u]);
+                __half tmp[8];
+#pragma unroll
+                for (int j = 0; j < 8; ++j) { tmp[j] = __float2half(__bfloat162float(src[j])); }
+                const int unit = idx + u * S::kThreads;
+                *reinterpret_cast<uint4*>(&x_sh[buf][unit / 4][(unit % 4) * 8]) =
+                    *reinterpret_cast<const uint4*>(tmp);
+            }
         }
         const int r_row = lane >> 2;
         const int q     = lane & 3;

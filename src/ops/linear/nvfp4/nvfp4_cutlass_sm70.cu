@@ -3,6 +3,7 @@
 #include "core/device.h"
 #include "core/layout.h"
 #include "ops/linear/nvfp4/nvfp4_codec.cuh"
+#include "ops/linear/nvfp4/nvfp4_launch.h"
 
 #include "cutlass/bfloat16.h"
 #include "cutlass/cutlass.h"
@@ -13,6 +14,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
+#include <cstdlib>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -190,6 +192,23 @@ void nvfp4_cutlass_sm70_launch(const Tensor& x, const Weight& w, Tensor& out, Wo
     const std::int32_t k    = x.ne[0];
     const std::int32_t cols = x.ne[1];
     const std::int32_t n    = w.n;
+
+    // Act-stationary fused-dequant GEMM (nvfp4_volta_as_gemm.cuh), opt-in behind
+    // NINFER_NVFP4_AS: decodes the packed weight into shared memory per K-step instead of
+    // staging the whole matrix as FP16 in global memory, so per-call HBM traffic stops
+    // scaling with the T/128 re-reads of an FP16 weight copy that dominate this route at
+    // prefill widths (and stay flat as chunks shrink). Same contract as the CUTLASS path
+    // below -- a plain bf16 [n, cols] GEMM into `out`; callers keep their silu_mul /
+    // residual_add / allreduce -- and the workspace reservation above is simply
+    // under-used, so no capacity accounting changes.
+    static const bool use_as = std::getenv("NINFER_NVFP4_AS") != nullptr;
+    if (use_as && cols > 32 && w.qtype == QType::NVFP4 && k % 64 == 0 &&
+        (w.layout == QuantLayout::BlockScaleK16M128x4 ||
+         w.layout == QuantLayout::VoltaQpnPrepacked)) {
+        nvfp4_volta_as_gemm_launch(x, w, out, stream);
+        return;
+    }
+
     cutlass::gemm::GemmCoord problem_size(cols, n, k);
     typename Gemm::Arguments sizing_arguments{
         problem_size, {nullptr, k}, {nullptr, k}, {nullptr, n}, {nullptr, n},

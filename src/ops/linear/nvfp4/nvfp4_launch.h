@@ -36,6 +36,13 @@ void launch_nvfp4_volta_mma(const Tensor& x, const Weight& w, Tensor& out, Works
 void nvfp4_volta_tmma_gemm_launch(const Tensor& x, const Weight& weight, Tensor& out,
                                   cudaStream_t stream);
 
+// Act-stationary fused-dequant GEMM (nvfp4_volta_as_gemm.cuh): CTA 128 tokens x 128 output
+// rows, activations staged once per CTA, weights decoded through shared memory per K-step --
+// no FP16 weight staging, both raw and VoltaQpnPrepacked layouts. Hooked inside
+// nvfp4_cutlass_sm70_launch behind NINFER_NVFP4_AS.
+void nvfp4_volta_as_gemm_launch(const Tensor& x, const Weight& weight, Tensor& out,
+                                cudaStream_t stream);
+
 #endif // NINFER_VOLTA_BUILD
 
 } // namespace ninfer::ops::detail

@@ -330,6 +330,7 @@ if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
     ops/linear/nvfp4/nvfp4_volta_qpn_gemm.cu
     ops/linear/nvfp4/nvfp4_volta_mma_gemm.cu
     ops/linear/nvfp4/nvfp4_volta_tmma_gemm.cu
+    ops/linear/nvfp4/nvfp4_volta_as_gemm.cu
     ops/linear/nvfp4/nvfp4_cutlass_sm70.cu
     ops/linear/nvfp4/nvfp4_prepack_sm70.cu
     ops/linear/q4/q4_volta_mma_gemm.cu
