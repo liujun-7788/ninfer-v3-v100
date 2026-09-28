@@ -126,7 +126,15 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
     // genuine Volta entry above uses 64; giving 256/256 the same halves shared memory
     // to 35,072 B and doubles occupancy to 2 blocks/SM, with no change in accuracy.
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 32, 128, 2,  32, 128, 128,  64, 1, false);
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 64, 128, 2,  32, 128, 128,  64, 1, false);
+    // ninfer: wider prompt tiles. The whole key range is re-read for every ncols1 query
+    // rows, so ncols=64 (ncols1=32) halves and ncols=128 (ncols1=64) quarters the key-range
+    // traffic. Both keep the Q tile in shared memory: Q_in_reg on Volta needs ~128 registers
+    // per thread for the Q fragment alone, which spills (cuobjdump: 255 regs + 560 B stack)
+    // and lost 21-28% of prefill. With Q in smem the staging has to be trimmed instead
+    // (nbatch_K2/V2 128 -> 64) so the tile still fits 2 blocks/SM at ncols=64 (45,056 B) and
+    // 1 block of 8 warps at ncols=128 (81,408 B), keeping 8 warps per SM in both cases.
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 64, 128, 2,  32,  64,  64,  64, 1, false);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 128, 256, 1, 32,  64,  64,  64, 1, false);
 
     // TODO tune specifically for Volta
     return ggml_cuda_fattn_mma_get_config_ampere(DKQ, DV, ncols);

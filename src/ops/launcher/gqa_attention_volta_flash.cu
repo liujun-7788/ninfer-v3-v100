@@ -31,6 +31,7 @@
 #include <cuda_fp16.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -58,29 +59,44 @@ struct VoltaFlashTiling;
 template <>
 struct VoltaFlashTiling<CausalD256H24Kv4> {
     static constexpr int ncols2 = 2;
-    static constexpr int ncols1 = 16;
+    // 64 query rows per key-range pass (ncols = 128): measured on V100-32G against the
+    // upstream 16-row tile, 16k 1.06k vs 1.03k, 65k 861 vs 751, 131k 690 vs 534 tok/s.
+    static constexpr int ncols1 = 64;
+    static constexpr bool wide_variants = true;
 };
 
 template <>
 struct VoltaFlashTiling<CausalD256H16Kv2> {
     static constexpr int ncols2 = 8;
     static constexpr int ncols1 = 4;
+    static constexpr bool wide_variants = false;
 };
 
 template <>
 struct VoltaFlashTiling<CausalD256H12Kv2> {
     static constexpr int ncols2 = 2;
-    static constexpr int ncols1 = 16;
+    static constexpr int ncols1 = 64;
+    static constexpr bool wide_variants = true;
 };
 
-template <typename Geometry>
+// NINFER_FLASH_NCOLS1 pins one of the compiled prompt tilings for A/B runs; 0 (or unset)
+// keeps the registered geometry's table entry.
+inline int flash_ncols1_request() {
+    static const int value = [] {
+        const char* env = std::getenv("NINFER_FLASH_NCOLS1");
+        return env == nullptr ? 0 : std::atoi(env);
+    }();
+    return value;
+}
+
+template <typename Geometry, int kNCols1>
 struct VoltaFlashParams {
     static constexpr int kQHeads  = Geometry::QHeads;
     static constexpr int kKVHeads = Geometry::KVHeads;
     static constexpr int kGroup   = Geometry::GroupSize;
     static constexpr int kNcols2  = VoltaFlashTiling<Geometry>::ncols2;
-    static constexpr int kNcols1  = VoltaFlashTiling<Geometry>::ncols1;
-    static constexpr int kNcols   = kNcols1 * kNcols2;
+    static constexpr int kNcols1  = kNCols1;
+    static constexpr int kNcols   = kNCols1 * kNcols2;
 
     static_assert(kQHeads / kKVHeads == kGroup, "gqa ratio mismatch");
     static_assert(kGroup % kNcols2 == 0, "ncols2 must divide the GQA group");
@@ -334,11 +350,11 @@ struct FlashLaunchConfig {
     int    nsm            = 0;
 };
 
-// One cached config per geometry: the shared-memory and occupancy figures depend
-// only on the tiling, so they are resolved once per instantiation.
-template <typename Geometry>
+// One cached config per geometry and tiling: the shared-memory and occupancy figures
+// depend only on the tiling, so they are resolved once per instantiation.
+template <typename Geometry, int kNCols1>
 const FlashLaunchConfig& flash_launch_config() {
-    using P = VoltaFlashParams<Geometry>;
+    using P = VoltaFlashParams<Geometry, kNCols1>;
 
     static const FlashLaunchConfig config = [] {
         FlashLaunchConfig c;
@@ -386,18 +402,18 @@ const FlashLaunchConfig& flash_launch_config() {
 }
 
 // One Q-block through the vendored kernel plus its stream-K fixup.
-template <typename Geometry>
+template <typename Geometry, int kNCols1>
 void launch_flash_block(const float* q_f32, const half* k_f16, const half* v_f16, const half* mask,
                         float* dst, float2* dst_meta, int tokens, int n_kv, int mask_stride,
                         float scale, cudaStream_t stream) {
-    using P                    = VoltaFlashParams<Geometry>;
+    using P                    = VoltaFlashParams<Geometry, kNCols1>;
     constexpr int kQHeads      = P::kQHeads;
     constexpr int kKVHeads     = P::kKVHeads;
     constexpr int kGroup       = P::kGroup;
     constexpr int kNcols1      = P::kNcols1;
     constexpr int kNcols2      = P::kNcols2;
 
-    const FlashLaunchConfig& c = flash_launch_config<Geometry>();
+    const FlashLaunchConfig& c = flash_launch_config<Geometry, kNCols1>();
 
     const int ntiles_x     = (tokens + kNcols1 - 1) / kNcols1;
     const int ntiles_z_gqa = (kGroup + kNcols2 - 1) / kNcols2;
@@ -462,10 +478,10 @@ void launch_flash_block(const float* q_f32, const half* k_f16, const half* v_f16
 
 // ---------------------------------------------------------------------------
 
-template <typename Geometry>
+template <typename Geometry, int kNCols1>
 std::size_t meta_elements_impl(std::int32_t tokens) {
-    using P                    = VoltaFlashParams<Geometry>;
-    const FlashLaunchConfig& c = flash_launch_config<Geometry>();
+    using P                    = VoltaFlashParams<Geometry, kNCols1>;
+    const FlashLaunchConfig& c = flash_launch_config<Geometry, kNCols1>();
     const int ntiles_x         = (tokens + P::kNcols1 - 1) / P::kNcols1;
     const int ntiles_dst = ntiles_x * ((P::kGroup + P::kNcols2 - 1) / P::kNcols2) * P::kKVHeads;
     const int max_blocks = c.blocks_per_sm * c.nsm;
@@ -474,14 +490,14 @@ std::size_t meta_elements_impl(std::int32_t tokens) {
     return static_cast<std::size_t>(nblocks) * P::kNcols * (2 + kDV / 2);
 }
 
-template <typename Geometry>
+template <typename Geometry, int kNCols1>
 void volta_flash_launch_impl(const Tensor& q, const Tensor& k, const Tensor& v,
                              const Tensor& positions, const Tensor& table_rows, float scale,
                              PagedKVBatchLayerView cache, CausalAttentionExecutionEnvelope envelope,
                              std::int32_t q_block_tokens, Tensor& k_gathered, Tensor& v_gathered,
                              Tensor& mask, Tensor& q_f32, Tensor& out_f32, Tensor& dst_meta,
                              Tensor& out, cudaStream_t stream) {
-    using P                          = VoltaFlashParams<Geometry>;
+    using P                          = VoltaFlashParams<Geometry, kNCols1>;
     constexpr int kQHeads            = P::kQHeads;
     constexpr int kKVHeads           = P::kKVHeads;
     const std::int32_t width         = q.ne[2];
@@ -567,7 +583,7 @@ void volta_flash_launch_impl(const Tensor& q, const Tensor& k, const Tensor& v,
 
         cudaMemsetAsync(out_f32.data, 0, static_cast<std::size_t>(q_count) * sizeof(float), stream);
 
-        launch_flash_block<Geometry>(static_cast<const float*>(q_f32.data),
+        launch_flash_block<Geometry, kNCols1>(static_cast<const float*>(q_f32.data),
                            static_cast<const half*>(k_gathered.data),
                            static_cast<const half*>(v_gathered.data),
                            static_cast<const half*>(mask.data),
@@ -587,11 +603,53 @@ void volta_flash_launch_impl(const Tensor& q, const Tensor& k, const Tensor& v,
 // The registered geometries differ only in tiling; all are instantiated so
 // the route can serve 27B (24q/4kv), 35B-A3B (16q/2kv) and the TP2 head-split
 // 27B (12q/2kv) from one launcher.
+//
+// Within the group-6 geometries (24q/4kv, 12q/2kv) the prompt tiling is selectable at
+// run time: the key range is re-read once per ncols1 query rows, so a wider tile cuts the
+// key-range traffic proportionally at the cost of shared memory and registers per CTA.
+template <typename Geometry>
+std::size_t meta_elements_for(std::int32_t tokens) {
+    std::size_t elements = meta_elements_impl<Geometry, VoltaFlashTiling<Geometry>::ncols1>(tokens);
+    if constexpr (VoltaFlashTiling<Geometry>::wide_variants) {
+        elements = std::max(elements, meta_elements_impl<Geometry, 32>(tokens));
+        elements = std::max(elements, meta_elements_impl<Geometry, 64>(tokens));
+    }
+    return elements;
+}
+
 std::size_t causal_attention_volta_flash_meta_elements(std::int32_t q_heads, std::int32_t tokens) {
-    if (q_heads == CausalD256H24Kv4::QHeads) { return meta_elements_impl<CausalD256H24Kv4>(tokens); }
-    if (q_heads == CausalD256H16Kv2::QHeads) { return meta_elements_impl<CausalD256H16Kv2>(tokens); }
-    if (q_heads == CausalD256H12Kv2::QHeads) { return meta_elements_impl<CausalD256H12Kv2>(tokens); }
+    if (q_heads == CausalD256H24Kv4::QHeads) { return meta_elements_for<CausalD256H24Kv4>(tokens); }
+    if (q_heads == CausalD256H16Kv2::QHeads) { return meta_elements_for<CausalD256H16Kv2>(tokens); }
+    if (q_heads == CausalD256H12Kv2::QHeads) { return meta_elements_for<CausalD256H12Kv2>(tokens); }
     throw std::invalid_argument("gqa_attention volta flash: unsupported Q head geometry");
+}
+
+template <typename Geometry>
+void volta_flash_launch_dispatch(const Tensor& q, const Tensor& k, const Tensor& v,
+                                 const Tensor& positions, const Tensor& table_rows, float scale,
+                                 PagedKVBatchLayerView cache,
+                                 CausalAttentionExecutionEnvelope envelope,
+                                 std::int32_t q_block_tokens, Tensor& k_gathered,
+                                 Tensor& v_gathered, Tensor& mask, Tensor& q_f32, Tensor& out_f32,
+                                 Tensor& dst_meta, Tensor& out, cudaStream_t stream) {
+    if constexpr (VoltaFlashTiling<Geometry>::wide_variants) {
+        const int requested = flash_ncols1_request();
+        if (requested == 32) {
+            volta_flash_launch_impl<Geometry, 32>(q, k, v, positions, table_rows, scale, cache,
+                                                  envelope, q_block_tokens, k_gathered, v_gathered,
+                                                  mask, q_f32, out_f32, dst_meta, out, stream);
+            return;
+        }
+        if (requested == 64) {
+            volta_flash_launch_impl<Geometry, 64>(q, k, v, positions, table_rows, scale, cache,
+                                                  envelope, q_block_tokens, k_gathered, v_gathered,
+                                                  mask, q_f32, out_f32, dst_meta, out, stream);
+            return;
+        }
+    }
+    volta_flash_launch_impl<Geometry, VoltaFlashTiling<Geometry>::ncols1>(
+        q, k, v, positions, table_rows, scale, cache, envelope, q_block_tokens, k_gathered,
+        v_gathered, mask, q_f32, out_f32, dst_meta, out, stream);
 }
 
 void causal_attention_volta_flash_launch(const Tensor& q, const Tensor& k, const Tensor& v,
@@ -602,19 +660,19 @@ void causal_attention_volta_flash_launch(const Tensor& q, const Tensor& k, const
                                       Tensor& q_f32, Tensor& out_f32, Tensor& dst_meta, Tensor& out,
                                       cudaStream_t stream) {
     if (q.ne[1] == CausalD256H24Kv4::QHeads) {
-        volta_flash_launch_impl<CausalD256H24Kv4>(q, k, v, positions, table_rows, scale, cache,
+        volta_flash_launch_dispatch<CausalD256H24Kv4>(q, k, v, positions, table_rows, scale, cache,
                                                envelope, q_block_tokens, k_gathered, v_gathered,
                                                mask, q_f32, out_f32, dst_meta, out, stream);
         return;
     }
     if (q.ne[1] == CausalD256H16Kv2::QHeads) {
-        volta_flash_launch_impl<CausalD256H16Kv2>(q, k, v, positions, table_rows, scale, cache,
+        volta_flash_launch_dispatch<CausalD256H16Kv2>(q, k, v, positions, table_rows, scale, cache,
                                                envelope, q_block_tokens, k_gathered, v_gathered,
                                                mask, q_f32, out_f32, dst_meta, out, stream);
         return;
     }
     if (q.ne[1] == CausalD256H12Kv2::QHeads) {
-        volta_flash_launch_impl<CausalD256H12Kv2>(q, k, v, positions, table_rows, scale, cache,
+        volta_flash_launch_dispatch<CausalD256H12Kv2>(q, k, v, positions, table_rows, scale, cache,
                                                envelope, q_block_tokens, k_gathered, v_gathered,
                                                mask, q_f32, out_f32, dst_meta, out, stream);
         return;
