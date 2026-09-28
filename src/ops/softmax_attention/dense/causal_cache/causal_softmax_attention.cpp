@@ -7,8 +7,11 @@
 #include "ops/softmax_attention/dense/causal_cache/geometry.cuh"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -531,6 +534,125 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
     return maximum;
 }
 
+// NINFER_PREFILL_PROF: aggregate per-call trace of every causal attention dispatch. One line per
+// eager call (geometry, resolved route and device-side elapsed), so the per-layer attention cost of
+// a prefill chunk can be summed offline instead of being inferred from a single route. Reporting is
+// deferred by one call (the previous pair is read on the next call), so the host never blocks on
+// the device. Calls issued while the stream is capturing are logged as ATTNCAP without timing, which
+// makes the per-layer call count of a captured graph visible too.
+struct AttentionCallTrace {
+    cudaStream_t stream    = nullptr;
+    cudaEvent_t start      = nullptr;
+    cudaEvent_t end        = nullptr;
+    bool active            = false;
+    std::uint32_t visible  = 0;
+    std::int32_t width     = 0;
+    std::int32_t batch     = 0;
+    std::int32_t q_heads   = 0;
+    std::int32_t route     = -1;
+    std::int32_t storage   = -1;
+    const void* rows       = nullptr;
+    const void* out        = nullptr;
+    std::int64_t seq       = 0;
+
+    [[nodiscard]] static bool enabled() {
+        static const bool on = std::getenv("NINFER_PREFILL_PROF") != nullptr;
+        return on;
+    }
+    static cudaEvent_t& pending_start() {
+        static thread_local cudaEvent_t value = nullptr;
+        return value;
+    }
+    static cudaEvent_t& pending_end() {
+        static thread_local cudaEvent_t value = nullptr;
+        return value;
+    }
+    static std::uint32_t& pending_visible() {
+        static thread_local std::uint32_t value = 0;
+        return value;
+    }
+    static std::int32_t& pending_width() {
+        static thread_local std::int32_t value = 0;
+        return value;
+    }
+    static std::int32_t& pending_batch() {
+        static thread_local std::int32_t value = 0;
+        return value;
+    }
+    static std::int32_t& pending_route() {
+        static thread_local std::int32_t value = -1;
+        return value;
+    }
+    static std::int32_t& pending_storage() {
+        static thread_local std::int32_t value = -1;
+        return value;
+    }
+    static std::int32_t& pending_q_heads() {
+        static thread_local std::int32_t value = 0;
+        return value;
+    }
+    static const void*& pending_rows() {
+        static thread_local const void* value = nullptr;
+        return value;
+    }
+    static const void*& pending_out() {
+        static thread_local const void* value = nullptr;
+        return value;
+    }
+
+    AttentionCallTrace(cudaStream_t s, std::int32_t q_heads_, std::int32_t width_,
+                       std::int32_t batch_, std::int32_t storage_,
+                       detail::CausalAttentionRoute route_, std::uint32_t visible_,
+                       const void* rows_, const void* out_)
+        : stream(s), visible(visible_), width(width_), batch(batch_), q_heads(q_heads_),
+          route(static_cast<std::int32_t>(route_)), storage(storage_), rows(rows_), out(out_) {
+        if (!enabled()) return;
+        static std::int64_t sequence = 0;
+        seq = ++sequence;
+        cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+        cudaStreamIsCapturing(stream, &cap);
+        if (cap != cudaStreamCaptureStatusNone) {
+            std::fprintf(stderr,
+                         "ATTNCAP seq=%lld vis=%u w=%d b=%d qh=%d route=%d st=%d rows=%p out=%p\n",
+                         static_cast<long long>(seq), visible, width, batch, q_heads, route, storage,
+                         rows, out);
+            return;
+        }
+        if (cudaEventCreate(&start) != cudaSuccess || cudaEventCreate(&end) != cudaSuccess) return;
+        active = true;
+        (void)cudaEventRecord(start, stream);
+    }
+    AttentionCallTrace(const AttentionCallTrace&)            = delete;
+    AttentionCallTrace& operator=(const AttentionCallTrace&) = delete;
+    ~AttentionCallTrace() {
+        if (!active) return;
+        (void)cudaEventRecord(end, stream);
+        if (pending_start() != nullptr) {
+            float ms = 0.0f;
+            if (cudaEventElapsedTime(&ms, pending_start(), pending_end()) == cudaSuccess) {
+                std::fprintf(stderr,
+                             "ATTNCALL vis=%u w=%d b=%d qh=%d route=%d st=%d rows=%p out=%p "
+                             "ms=%.3f\n",
+                             pending_visible(), pending_width(), pending_batch(),
+                             pending_q_heads(), pending_route(), pending_storage(), pending_rows(),
+                             pending_out(), ms);
+            }
+            (void)cudaEventDestroy(pending_start());
+            (void)cudaEventDestroy(pending_end());
+        }
+        pending_start()   = start;
+        pending_end()     = end;
+        pending_visible() = visible;
+        pending_width()   = width;
+        pending_batch()   = batch;
+        pending_route()   = route;
+        pending_storage() = storage;
+        pending_q_heads() = q_heads;
+        pending_rows()    = rows;
+        pending_out()     = out;
+    }
+};
+
 void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                               const Tensor& positions, const Tensor& valid_columns,
                               const Tensor& kv_table_rows, AttentionHeadGeometry geometry,
@@ -554,15 +676,68 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     auto scope = workspace.scope();
     const detail::CausalAttentionRoute route =
         detail::causal_attention_resolve_route(q.ne[1], width, batch, cache.storage, envelope);
+    AttentionCallTrace trace(stream, q.ne[1], width, batch,
+                             static_cast<std::int32_t>(cache.storage), route,
+                             envelope.max_visible_keys,
+                             static_cast<const void*>(kv_table_rows.data),
+                             static_cast<const void*>(out.data));
 #ifdef NINFER_VOLTA_BUILD
     if (route == detail::CausalAttentionRoute::Prompt && valid_columns.data == nullptr &&
         volta_flash_route_possible(q.ne[1], width, batch, cache.storage)) {
+        // NINFER_PREFILL_PROF: per-call device timing of the wide-T flash attention path (the
+        // gathered-KV staging kernels plus the flash kernel itself). Deferred reporting: the
+        // previous call's elapsed is read one call later, so the host never blocks and the
+        // capture path skips the probe entirely.
+        static const bool prof = std::getenv("NINFER_PREFILL_PROF") != nullptr;
+        static cudaEvent_t prof_start = nullptr, prof_end = nullptr;
+        static int prof_prev_ctx = 0, prof_prev_tokens = 0;
+        cudaStreamCaptureStatus prof_cap = cudaStreamCaptureStatusNone;
+        cudaStreamIsCapturing(stream, &prof_cap);
+        const bool prof_this = prof && prof_cap == cudaStreamCaptureStatusNone;
+        cudaEvent_t prof_ev0 = nullptr, prof_ev1 = nullptr;
+        if (prof_this) {
+            cudaEventCreate(&prof_ev0);
+            cudaEventCreate(&prof_ev1);
+            cudaEventRecord(prof_ev0, stream);
+        }
+        const auto host_begin = std::chrono::steady_clock::now();
         VoltaFlashWorkspace staging =
             allocate_volta_flash_workspace(workspace, q.ne[1], width, envelope);
+        const auto host_mid = std::chrono::steady_clock::now();
         detail::causal_attention_volta_flash_launch(
             q, k, v, positions, kv_table_rows, scale, cache, envelope,
             detail::kVoltaFlashQBlockTokens, staging.k_gathered, staging.v_gathered,
             staging.mask, staging.q_f32, staging.out_f32, staging.dst_meta, out, stream);
+        const auto host_end = std::chrono::steady_clock::now();
+        // NINFER_PREFILL_PROF host split: the workspace allocation and the launcher call are
+        // host-side costs the device event pair cannot separate from the kernels, and they are the
+        // prime suspect for the long-context prefill decay. Printed immediately (host clocks never
+        // need a device sync), so it also lands while the device pair is still deferred.
+        if (prof_this) {
+            const auto ms_between = [](std::chrono::steady_clock::time_point a,
+                                       std::chrono::steady_clock::time_point b) {
+                return std::chrono::duration<double, std::milli>(b - a).count();
+            };
+            std::fprintf(stderr, "PREFPROF2 ctx=%u w=%d alloc_ms=%.3f launch_ms=%.3f host_ms=%.3f\n",
+                         envelope.max_visible_keys, width, ms_between(host_begin, host_mid),
+                         ms_between(host_mid, host_end), ms_between(host_begin, host_end));
+        }
+        if (prof_this) {
+            cudaEventRecord(prof_ev1, stream);
+            if (prof_start != nullptr) {
+                float ms = 0.0f;
+                if (cudaEventElapsedTime(&ms, prof_start, prof_end) == cudaSuccess) {
+                    std::fprintf(stderr, "PREFPROF ctx=%d tokens=%d take=%.3f ms\n",
+                                 prof_prev_ctx, prof_prev_tokens, ms);
+                }
+                cudaEventDestroy(prof_start);
+                cudaEventDestroy(prof_end);
+            }
+            prof_start       = prof_ev0;
+            prof_end         = prof_ev1;
+            prof_prev_ctx    = static_cast<int>(envelope.max_visible_keys);
+            prof_prev_tokens = width;
+        }
         return;
     }
     if (cache.storage == KvCacheStorage::Fp8E4M3Row256) {

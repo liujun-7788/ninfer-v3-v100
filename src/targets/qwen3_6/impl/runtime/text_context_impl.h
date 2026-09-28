@@ -850,9 +850,117 @@ void TextContext::mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor
     proposal_argmax(hidden, logits, draft_tokens);
 }
 
+// NINFER_PREFILL_PROF: device timing of the three per-layer building blocks (attention mixer, GDN
+// mixer, MLP tail). One line per eager call; the previous call's event pair is read on the next call
+// so the host never blocks on the device, and the caller aggregates by width and pass offline.
+// Captured graph bodies are skipped (they carry no device timing here).
+struct LayerDeviceTrace {
+    static constexpr int kAttn = 0;
+    static constexpr int kGdn  = 1;
+    static constexpr int kMlp  = 2;
+
+    cudaStream_t stream = nullptr;
+    cudaEvent_t start   = nullptr;
+    cudaEvent_t end     = nullptr;
+    bool active         = false;
+    int kind            = 0;
+    int idx             = 0;
+    int w               = 0;
+    int ph              = 0;
+
+    [[nodiscard]] static bool enabled() {
+        static const bool on = std::getenv("NINFER_PREFILL_PROF") != nullptr;
+        return on;
+    }
+    static cudaEvent_t& pending_start() {
+        static thread_local cudaEvent_t value = nullptr;
+        return value;
+    }
+    static cudaEvent_t& pending_end() {
+        static thread_local cudaEvent_t value = nullptr;
+        return value;
+    }
+    static int& pending_kind() {
+        static thread_local int value = 0;
+        return value;
+    }
+    static int& pending_idx() {
+        static thread_local int value = 0;
+        return value;
+    }
+    static int& pending_w() {
+        static thread_local int value = 0;
+        return value;
+    }
+    static int& pending_ph() {
+        static thread_local int value = 0;
+        return value;
+    }
+
+    LayerDeviceTrace(cudaStream_t s, int kind_, int idx_, int w_, int ph_)
+        : stream(s), kind(kind_), idx(idx_), w(w_), ph(ph_) {
+        if (!enabled()) { return; }
+        cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+        const cudaError_t cap_err = cudaStreamIsCapturing(stream, &cap);
+        cudaError_t ev0_err = cudaSuccess, ev1_err = cudaSuccess, rec_err = cudaSuccess;
+        if (cap_err == cudaSuccess && cap != cudaStreamCaptureStatusNone) { return; }
+        ev0_err = cudaEventCreate(&start);
+        ev1_err = cudaEventCreate(&end);
+        if (ev0_err != cudaSuccess || ev1_err != cudaSuccess) { return; }
+        active  = true;
+        rec_err = cudaEventRecord(start, stream);
+        if (cap_err != cudaSuccess || rec_err != cudaSuccess) {
+            static int reported = 0;
+            if (++reported <= 40) {
+                std::fprintf(stderr,
+                             "LTRACE_ERR cap=%d ev0=%d ev1=%d rec=%d kind=%d idx=%d w=%d ph=%d\n",
+                             static_cast<int>(cap_err), static_cast<int>(ev0_err),
+                             static_cast<int>(ev1_err), static_cast<int>(rec_err), kind, idx, w,
+                             ph);
+            }
+        }
+    }
+    LayerDeviceTrace(const LayerDeviceTrace&)            = delete;
+    LayerDeviceTrace& operator=(const LayerDeviceTrace&) = delete;
+    ~LayerDeviceTrace() {
+        if (!active) { return; }
+        (void)cudaEventRecord(end, stream);
+        if (pending_start() != nullptr) {
+            float ms = 0.0f;
+            const cudaError_t el_err = cudaEventElapsedTime(&ms, pending_start(), pending_end());
+            if (el_err == cudaSuccess) {
+                std::fprintf(stderr, "LTIME kind=%d idx=%d w=%d ph=%d ms=%.4f\n", pending_kind(),
+                             pending_idx(), pending_w(), pending_ph(), ms);
+            } else {
+                static int reported = 0;
+                if (++reported <= 40) {
+                    std::fprintf(stderr, "LTIME_ERR el=%d kind=%d idx=%d w=%d ph=%d\n",
+                                 static_cast<int>(el_err), pending_kind(), pending_idx(),
+                                 pending_w(), pending_ph());
+                }
+            }
+            (void)cudaEventDestroy(pending_start());
+            (void)cudaEventDestroy(pending_end());
+        }
+        pending_start() = start;
+        pending_end()   = end;
+        pending_kind()  = kind;
+        pending_idx()   = idx;
+        pending_w()     = w;
+        pending_ph()    = ph;
+    }
+};
+
 void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
+    LayerDeviceTrace layer_trace(s, LayerDeviceTrace::kAttn, fidx, T, static_cast<int>(ph));
+    if (std::getenv("NINFER_PREFILL_PROF") != nullptr) {
+        cudaStreamCaptureStatus mix_cap = cudaStreamCaptureStatusNone;
+        cudaStreamIsCapturing(ctx_.stream, &mix_cap);
+        std::fprintf(stderr, "MIX fidx=%d ph=%d cap=%d w=%d\n", fidx, static_cast<int>(ph),
+                     static_cast<int>(mix_cap != cudaStreamCaptureStatusNone), T);
+    }
     if (active_causal_attention_envelope_ == nullptr) {
         throw std::logic_error("Text GQA execution envelope is not set");
     }
@@ -916,6 +1024,7 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
 void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
+    LayerDeviceTrace layer_trace(s, LayerDeviceTrace::kGdn, gidx, T, static_cast<int>(ph));
 
     const auto control = workspace_recipe::gdn_control<TextConfig>(work_, T);
     Tensor h           = control.hidden;
@@ -1044,6 +1153,7 @@ void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Ph
                            const ops::SparseMoeHints& hints) {
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
+    LayerDeviceTrace layer_trace(s, LayerDeviceTrace::kMlp, 0, T, static_cast<int>(ph));
     Tensor h       = workspace_recipe::post_mixer_hidden<TextConfig>(work_, T);
     ops::rmsnorm(x, *post_norm, kCfg.rms_eps, true, h, s);
 
@@ -1105,6 +1215,13 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
         } else {
             const int gidx       = ModelConfig::gdn_idx(layer);
             const GdnLayerW& gdn = gdn_.at(static_cast<std::size_t>(gidx));
+            if (std::getenv("NINFER_PREFILL_PROF") != nullptr) {
+                cudaStreamCaptureStatus gdn_cap = cudaStreamCaptureStatusNone;
+                cudaStreamIsCapturing(ctx_.stream, &gdn_cap);
+                std::fprintf(stderr, "GDNMIX layer=%u gidx=%d ph=%d cap=%d w=%d\n", layer, gidx,
+                             static_cast<int>(ph),
+                             static_cast<int>(gdn_cap != cudaStreamCaptureStatusNone), x.ne[1]);
+            }
             nvtx::ScopedRange layer_range(prefill ? nvtx::Name::PrefillLayerGdn
                                                   : nvtx::Name::VerifyLayerGdn,
                                           nvtx::Category::Gdn, static_cast<std::uint64_t>(layer));
