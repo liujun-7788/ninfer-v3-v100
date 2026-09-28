@@ -528,9 +528,11 @@ private:
             snapshot.waiting_requests = static_cast<std::uint32_t>(pending_.size());
         }
         snapshot.prefilling_requests = 0;
-        if (const auto lane = scheduler_.prefill_lane();
-            lane && slots_[*lane] != nullptr && !slots_[*lane]->capture_pending) {
-            snapshot.prefilling_requests = 1;
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            if (scheduler_.is_prefill_lane(lane) && slots_[lane] != nullptr &&
+                !slots_[lane]->capture_pending) {
+                ++snapshot.prefilling_requests;
+            }
         }
         snapshot.materializing_requests = materializing_.has_value() ? 1U : 0U;
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
@@ -984,7 +986,7 @@ private:
             auto aborted = resources_.abort(*instance_.program, *request->lane, *request->sequence);
             request->generation_timings = aborted.timings;
             request->speculative_stats  = std::move(aborted.speculative);
-            if (scheduler_.prefill_lane() == lane) { scheduler_.clear_prefill_lane(lane); }
+            if (scheduler_.is_prefill_lane(lane)) { scheduler_.clear_prefill_lane(lane); }
             append_output(request, request->output.commit_preview());
             finish_engine_phase(boundary, EngineHostPhase::Boundary);
             complete_success(request, FinishReason::Cancelled);
@@ -1366,7 +1368,7 @@ private:
             throw std::logic_error("runtime Begin summary differs from committed admission");
         }
         const std::uint32_t lane = request->lane->value;
-        if (scheduler_.prefill_lane() == lane) {
+        if (scheduler_.is_prefill_lane(lane)) {
             scheduler_.clear_prefill_lane(lane);
             request_admission_check();
         }
@@ -1380,7 +1382,7 @@ private:
     void run_prefill_step(const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
         nvtx::ScopedRange prefill_range(nvtx::Name::Prefill, nvtx::Category::Prefill);
         EnginePhaseScope setup(*this, EngineHostPhase::CommitOutput);
-        const auto prefill_lane = scheduler_.prefill_lane();
+        const auto prefill_lane = scheduler_.next_prefill_lane();
         if (!prefill_lane) { throw std::logic_error("no request owns staged prefill"); }
         const std::uint32_t lane = *prefill_lane;
         const auto request       = slots_[lane];
@@ -1924,6 +1926,13 @@ private:
 
     void worker_loop() noexcept {
         bool previous_unit_was_decode = false;
+        // Multi-lane staged prefill cap (NINFER_PREFILL_LANES=1 restores the historical
+        // single-lane serialization; unset/0 keeps the full-concurrency default).
+        {
+            const char* e = std::getenv("NINFER_PREFILL_LANES");
+            scheduler_.set_prefill_lane_cap(e == nullptr ? 0u : static_cast<std::uint32_t>(
+                                                                     std::atoi(e)));
+        }
         // Decode-burst knob: consecutive decode/control units allowed between prefill chunks
         // while a prefill lane is active. 1 reproduces the strict alternation.
         const std::uint32_t decode_burst_max = [] {
@@ -1993,11 +2002,12 @@ private:
                 membership = scheduler_.build_round_membership(slots_, max_concurrency_);
 
                 bool prefill_runnable = false;
-                if (const auto lane = scheduler_.prefill_lane(); lane) {
-                    if (slots_[*lane] == nullptr || !slots_[*lane]->is_prefilling()) {
+                for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+                    if (!scheduler_.is_prefill_lane(lane)) { continue; }
+                    if (slots_[lane] == nullptr || !slots_[lane]->is_prefilling()) {
                         throw std::logic_error("prefill owner has no active Engine request");
                     }
-                    prefill_runnable = !slots_[*lane]->capture_pending;
+                    if (!slots_[lane]->capture_pending) { prefill_runnable = true; }
                 }
                 const ExecutionAction action =
                     scheduler_.choose_execution(!membership.empty(), prefill_runnable, decode_burst,
@@ -2022,6 +2032,15 @@ private:
                 finish_engine_phase(boundary, EngineHostPhase::Boundary);
             } catch (...) {
                 const std::exception_ptr error = std::current_exception();
+                // Diagnostics: surface the engine-fatal exception text (the request error path
+                // alone loses it). Keep until the multi-lane scheduler settles.
+                try {
+                    std::rethrow_exception(error);
+                } catch (const std::exception& e) {
+                    std::fprintf(stderr, "ENGINE_FATAL: %s\n", e.what());
+                } catch (...) {
+                    std::fprintf(stderr, "ENGINE_FATAL: non-standard exception\n");
+                }
                 HostPhaseMeasurement cleanup   = begin_host_phase();
                 fail_all_locked(error);
                 finish_engine_phase(cleanup, EngineHostPhase::Maintenance);

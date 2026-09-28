@@ -233,8 +233,21 @@ public:
     [[nodiscard]] bool should_attempt_admission(bool have_pending, bool admission_check_pending,
                                                 bool have_decode, bool previous_unit_was_decode,
                                                 bool context_transaction) const noexcept {
-        return have_pending && admission_check_pending && !context_transaction && !prefill_lane_ &&
+        // Multi-lane staged prefill: admission is no longer blocked by an in-flight prefill
+        // lane. Previously a single prefill lane serialized the queue behind it (the second
+        // request could not even be staged until the first finished prefilling, so at
+        // concurrency 2 the later request's TTFT was the sum of both prefills and the finish
+        // times spread apart). Capacity is still governed by the resource inspection; this
+        // gate only limits how many requests may be staged for prefill at once.
+        return have_pending && admission_check_pending && !context_transaction &&
+               prefill_lanes_count_ < prefill_lane_cap_ &&
                (!have_decode || previous_unit_was_decode);
+    }
+
+    // Cap on simultaneously staged prefill lanes (bisect knob: 1 restores the historical
+    // single-lane serialization).
+    void set_prefill_lane_cap(std::uint32_t cap) noexcept {
+        prefill_lane_cap_ = cap == 0 || cap > kMaximumConcurrency ? kMaximumConcurrency : cap;
     }
 
     // Decode-burst scheduling: while a prefill lane is active, run up to decode_burst_max
@@ -253,8 +266,28 @@ public:
         return have_decode ? ExecutionAction::Decode : ExecutionAction::Wait;
     }
 
-    [[nodiscard]] std::optional<std::uint32_t> prefill_lane() const noexcept {
-        return prefill_lane_;
+    // Staged prefill lanes: every admitted-but-not-finished-prefilling request owns one.
+    // Chunks are served round-robin (next_prefill_lane) so concurrent late arrivals advance
+    // together instead of queueing behind the first request's whole prompt.
+    [[nodiscard]] bool has_prefill_lane() const noexcept { return prefill_lanes_count_ != 0; }
+
+    [[nodiscard]] std::uint32_t staged_prefill_count() const noexcept {
+        return prefill_lanes_count_;
+    }
+
+    [[nodiscard]] bool is_prefill_lane(std::uint32_t lane) const noexcept {
+        return lane < kMaximumConcurrency && prefill_lanes_[lane];
+    }
+
+    [[nodiscard]] std::optional<std::uint32_t> next_prefill_lane() noexcept {
+        for (std::uint32_t step = 0; step < kMaximumConcurrency; ++step) {
+            const std::uint32_t lane = (prefill_cursor_ + step) % kMaximumConcurrency;
+            if (prefill_lanes_[lane]) {
+                prefill_cursor_ = (lane + 1) % kMaximumConcurrency;
+                return lane;
+            }
+        }
+        return std::nullopt;
     }
 
     [[nodiscard]] std::optional<std::uint64_t> protection_epoch() const noexcept {
@@ -262,15 +295,19 @@ public:
     }
 
     void set_prefill_lane(std::uint32_t lane) {
-        if (prefill_lane_) { throw std::logic_error("multiple requests own staged prefill"); }
-        prefill_lane_ = lane;
+        if (lane >= kMaximumConcurrency || prefill_lanes_[lane]) {
+            throw std::logic_error("request already owns staged prefill");
+        }
+        prefill_lanes_[lane] = true;
+        ++prefill_lanes_count_;
     }
 
     void clear_prefill_lane(std::uint32_t lane) {
-        if (!prefill_lane_ || *prefill_lane_ != lane) {
+        if (lane >= kMaximumConcurrency || !prefill_lanes_[lane]) {
             throw std::logic_error("request does not own staged prefill");
         }
-        prefill_lane_.reset();
+        prefill_lanes_[lane] = false;
+        --prefill_lanes_count_;
     }
 
     void observe_fifo_head(std::optional<std::uint64_t> request_id) noexcept {
@@ -361,13 +398,18 @@ public:
     }
 
     void reset() noexcept {
-        prefill_lane_.reset();
+        prefill_lanes_.fill(false);
+        prefill_lanes_count_ = 0;
+        prefill_cursor_      = 0;
         fifo_head_id_.reset();
         protection_.reset();
     }
 
 private:
-    std::optional<std::uint32_t> prefill_lane_;
+    std::array<bool, kMaximumConcurrency> prefill_lanes_{};
+    std::uint32_t prefill_lanes_count_ = 0;
+    std::uint32_t prefill_cursor_      = 0;
+    std::uint32_t prefill_lane_cap_    = kMaximumConcurrency;
     std::optional<std::uint64_t> fifo_head_id_;
     std::optional<AdmissionProtection> protection_;
     std::uint64_t next_protection_epoch_ = 1;

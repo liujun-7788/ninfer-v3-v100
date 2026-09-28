@@ -592,7 +592,15 @@ public:
         std::optional<ResourcePlan> sealed =
             session.seal(std::move(*incumbent.assessed), prompt,
                          FinalScheduleIntent{.shared_capture_frontiers = shared_frontiers});
-        if (!sealed) { throw std::logic_error("selected pressure target could not be sealed"); }
+        if (!sealed) {
+            // The chosen pressure target's assessment no longer seals against the live
+            // session (observed with the multi-lane prefill scheduler: a concurrent
+            // admission over a shared-catalog/replay candidate could invalidate the
+            // incumbent). Infeasibility is a normal planner outcome elsewhere
+            // (Readiness::TemporarilyBlocked), so report it instead of killing the
+            // engine; the admission retries at a later worker boundary.
+            return std::nullopt;
+        }
 
         MaterializationDiagnostics diagnostics = make_diagnostics(
             incumbent.cost, targets_evaluated, projection_work, planning_started, search_elapsed_ns,

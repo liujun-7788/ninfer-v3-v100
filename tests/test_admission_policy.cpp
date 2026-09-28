@@ -180,7 +180,11 @@ int main() {
                           !scheduler.should_attempt_admission(true, true, false, false, true) &&
                           scheduler.choose_execution(true, false, 0, 1) == ExecutionAction::Decode,
                       "admission and GPU-unit fairness gates changed");
-    scheduler.set_prefill_lane(0);
+    // Multi-lane staged prefill: an in-flight prefill lane no longer blocks admission; the
+    // gate only closes once every concurrency lane is staged for prefill.
+    for (std::uint32_t lane = 0; lane < ninfer::kMaximumConcurrency; ++lane) {
+        scheduler.set_prefill_lane(lane);
+    }
     failures +=
         check(!scheduler.should_attempt_admission(true, true, true, true, false) &&
                   scheduler.choose_execution(true, true, 0, 1) == ExecutionAction::Decode &&
@@ -189,6 +193,23 @@ int main() {
                   scheduler.choose_execution(true, true, 8, 8) == ExecutionAction::Prefill,
               "prefill/decode alternation changed");
     scheduler.clear_prefill_lane(0);
+    failures += check(scheduler.should_attempt_admission(true, true, true, true, false),
+                      "prefill lane release did not reopen admission");
+    for (std::uint32_t lane = 1; lane < ninfer::kMaximumConcurrency; ++lane) {
+        scheduler.clear_prefill_lane(lane);
+    }
+    {
+        // Round-robin service over the staged lanes.
+        scheduler.set_prefill_lane(0);
+        scheduler.set_prefill_lane(2);
+        const auto first  = scheduler.next_prefill_lane();
+        const auto second = scheduler.next_prefill_lane();
+        const auto third  = scheduler.next_prefill_lane();
+        failures += check(first == 0 && second == 2 && third == 0,
+                          "staged prefill lanes do not rotate");
+        scheduler.clear_prefill_lane(0);
+        scheduler.clear_prefill_lane(2);
+    }
 
     std::array<std::shared_ptr<SchedulerRequest>, ninfer::kMaximumConcurrency> slots{};
     slots[0]                      = std::make_shared<SchedulerRequest>();
