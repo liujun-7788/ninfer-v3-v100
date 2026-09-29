@@ -62,3 +62,16 @@ profiles/
 
 # Claude Code personal/local settings (may contain API tokens)
 .claude/settings.local.json
+
+# Local dev artifacts that must not be published (untracked 2026-09-29)
+.venv-mp/
+/debug_*
+/debug_nccl*
+/debug_tp*
+/p2p_test*
+/pp_link_smoke
+/tp_group_smoke
+*.bppfix
+*.bppfix2
+*.bak_ppfix
+*.bak
