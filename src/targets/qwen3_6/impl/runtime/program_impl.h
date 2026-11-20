@@ -28,6 +28,16 @@
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
 namespace {
 
+// Largest aggregate width (rows x kMtpLookupMaximumWidth) of one context-lookup verification batch.
+// On Volta the lookup graph's FP8 GDN record workspace is sized for the <=32-column QPN route; a
+// wider batch reaches the CUTLASS route, whose workspace request exceeds that reservation.
+#ifdef NINFER_VOLTA_BUILD
+constexpr std::uint32_t kMtpLookupMaximumAggregateWidth = 32;
+#else
+constexpr std::uint32_t kMtpLookupMaximumAggregateWidth =
+    kMaximumConcurrency * qwen3_6::kMtpLookupMaximumWidth;
+#endif
+
 std::uint32_t normalized_private_capacity(const ContextCacheOptions& options) {
     if (!options.max_private_continuations || *options.max_private_continuations == 0) {
         throw std::logic_error("Qwen3.6 context cache private capacity is not normalized");
@@ -11278,6 +11288,10 @@ void ProgramImplCore::prepare_graphs() {
                                                state_images->continuation_hidden_store()};
         mtp_lookup_graphs.profiles.reserve(lookup_profiles.size() * max_concurrency);
         for (std::uint32_t batch_size = 1; batch_size <= max_concurrency; ++batch_size) {
+            // Wider batches have no lookup topology; decode_mtp_batch applies the same bound.
+            if (batch_size * qwen3_6::kMtpLookupMaximumWidth > kMtpLookupMaximumAggregateWidth) {
+                break;
+            }
             for (const GraphExecutionProfile planned : lookup_profiles) {
                 mtp_lookup_graphs.profiles.emplace_back();
                 DecodeGraphProfile& profile    = mtp_lookup_graphs.profiles.back();
@@ -11971,7 +11985,10 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         lookup_drafts{};
     // Long verification is one batch topology: every row must have a useful lookup continuation,
     // and its first five tokens must agree with the learned MTP proposal before the batch opts in.
-    bool use_lookup = true;
+    // A batch above the aggregate width bound has no captured lookup topology (prepare_graphs) and
+    // keeps the learned MTP round.
+    bool use_lookup =
+        lanes.size() * qwen3_6::kMtpLookupMaximumWidth <= kMtpLookupMaximumAggregateWidth;
     std::uint32_t maximum_frontier = 0;
     for (std::size_t row = 0; row < lanes.size(); ++row) {
         const std::uint32_t lane = lanes[row];
